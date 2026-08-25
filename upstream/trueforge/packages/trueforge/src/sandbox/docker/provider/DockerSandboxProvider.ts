@@ -56,6 +56,16 @@ const CONTAINER_NAME_PREFIX = 'tfy-sbx-';
 const OUTER_TIMEOUT_GRACE_MS = 10_000;
 /** Marks containers this provider owns, so stale ones can be found and reaped. */
 const OWNER_LABEL = 'com.truefoundry.trueforge.sandbox';
+/**
+ * Narrows ownership below "any TrueForge sandbox on this daemon".
+ *
+ * Without it a reaper can only operate globally, which makes it a footgun rather
+ * than a tool: a second server, another developer, or a test run sharing the
+ * daemon would have its live sandboxes deleted. Every reap is scoped, and a scope
+ * is required rather than defaulted at the call site.
+ */
+const SCOPE_LABEL = 'com.truefoundry.trueforge.sandbox.scope';
+const DEFAULT_SCOPE = 'default';
 /** Sandbox ids are ULIDs lowercased; anything else is not one of ours. */
 const SANDBOX_SLUG_RE = /^[0-9a-z]{26}$/;
 
@@ -82,6 +92,12 @@ export interface DockerSandboxProviderOptions {
    * one wastes a scarce device and slows container start.
    */
   gpus?: string;
+  /**
+   * Ownership scope for containers this provider creates. Only a reaper given the
+   * same scope will remove them, so two servers (or a test run and a dev server)
+   * sharing one daemon cannot delete each other's live sandboxes.
+   */
+  scope?: string;
   execTimeoutSeconds?: number;
   fileMaxBytesForDownload?: number;
   /**
@@ -101,6 +117,13 @@ interface RunResult {
   stdout: Buffer;
   stderr: string;
   timedOut: boolean;
+  /**
+   * The process was killed because stdout passed `maxStdoutBytes`. Distinct from
+   * an exit code: the child is killed mid-stream, so its status says nothing about
+   * why. Without this flag an oversized download is indistinguishable from a
+   * missing file.
+   */
+  outputCapExceeded: boolean;
 }
 
 /**
@@ -127,6 +150,7 @@ export class DockerSandboxProvider implements SandboxProvider {
   private readonly execTimeoutSeconds: number;
   private readonly fileMaxBytesForDownload: number;
   private readonly extraRunArgs: readonly string[];
+  private readonly scope: string;
   private readonly logger: Logger;
 
   /**
@@ -145,6 +169,7 @@ export class DockerSandboxProvider implements SandboxProvider {
     this.execTimeoutSeconds = options.execTimeoutSeconds ?? DEFAULT_EXEC_TIMEOUT_SECONDS;
     this.fileMaxBytesForDownload = options.fileMaxBytesForDownload ?? DEFAULT_FILE_MAX_BYTES;
     this.extraRunArgs = options.extraRunArgs ?? [];
+    this.scope = options.scope ?? DEFAULT_SCOPE;
     this.logger = options.logger;
   }
 
@@ -251,6 +276,8 @@ export class DockerSandboxProvider implements SandboxProvider {
       // relying on any process having kept a handle to them.
       '--label',
       `${OWNER_LABEL}=1`,
+      '--label',
+      `${SCOPE_LABEL}=${this.scope}`,
       ...(this.gpus === undefined ? [] : ['--gpus', this.gpus]),
       ...this.extraRunArgs,
       this.image,
@@ -391,6 +418,17 @@ export class DockerSandboxProvider implements SandboxProvider {
       raw: true,
     });
 
+    // The in-shell `wc -c` check and the `cat` are one invocation, but a sandbox
+    // process can still grow the file mid-stream, so the streaming cap is the
+    // final enforcement layer and has to report itself as such.
+    if (read.outputCapExceeded) {
+      throw new SandboxFileTooLargeError(
+        params.path,
+        this.fileMaxBytesForDownload + 1,
+        this.fileMaxBytesForDownload,
+      );
+    }
+
     switch (read.exitCode) {
       case 0:
         return read.stdout;
@@ -457,14 +495,31 @@ export class DockerSandboxProvider implements SandboxProvider {
    * reclaims sandboxes orphaned by a server restart or crash.
    */
   static async reapStale(params: {
+    /** Only containers created with this scope are eligible. */
+    scope: string;
     olderThanMs: number;
     logger: Logger;
     dockerBinary?: string;
   }): Promise<{ removed: string[] }> {
+    if (!Number.isFinite(params.olderThanMs) || params.olderThanMs < 0) {
+      // A negative cutoff would make every container in scope stale, including
+      // ones a live session is using. Callers that want that must say so by
+      // passing 0, which is at least explicit about meaning "everything".
+      throw new RangeError(`olderThanMs must be a non-negative number, got ${String(params.olderThanMs)}`);
+    }
     const docker = params.dockerBinary ?? 'docker';
     const listed = await runProcess({
       file: docker,
-      args: ['ps', '--all', '--filter', `label=${OWNER_LABEL}`, '--format', '{{.Names}}'],
+      args: [
+        'ps',
+        '--all',
+        '--filter',
+        `label=${OWNER_LABEL}`,
+        '--filter',
+        `label=${SCOPE_LABEL}=${params.scope}`,
+        '--format',
+        '{{.Names}}',
+      ],
       timeoutMs: PROBE_TIMEOUT_MS,
     }).catch(() => undefined);
     if (listed === undefined || listed.exitCode !== 0) {
@@ -521,7 +576,10 @@ export class DockerSandboxProvider implements SandboxProvider {
       ),
     );
     if (stale.length > 0) {
-      params.logger.info('DockerSandboxProvider reaped stale sandboxes', { count: stale.length });
+      params.logger.info('DockerSandboxProvider reaped stale sandboxes', {
+        count: stale.length,
+        scope: params.scope,
+      });
     }
     return { removed: stale };
   }
@@ -585,10 +643,14 @@ export class DockerSandboxProvider implements SandboxProvider {
     // Killing the local `docker exec` client does not kill the process inside the
     // container (runc#3359), so the bound has to be applied in there too. The
     // outer kill below remains as a backstop for a wedged daemon connection.
+    // `--verbose` makes the timeout self-describing on stderr ("timeout: sending
+    // signal TERM to command ..."). Needed because GNU timeout exits 124 when it
+    // fires *and* passes a command's own 124 straight through, so the status alone
+    // cannot distinguish them.
     const command =
       params.raw === true
         ? params.command
-        : `timeout ${String(params.timeoutSeconds)}s sh -c ${shellEscape(params.command)}`;
+        : `timeout --verbose ${String(params.timeoutSeconds)}s sh -c ${shellEscape(params.command)}`;
     args.push(params.containerName, 'sh', '-c', command);
 
     const result = await runProcess({
@@ -607,10 +669,11 @@ export class DockerSandboxProvider implements SandboxProvider {
           'the docker daemon connection may be wedged',
       );
     }
-    // 124 is `timeout`'s exit status when it killed the command.
-    if (result.exitCode === 124 && params.raw !== true) {
-      throw new Error(`command timed out after ${String(params.timeoutSeconds)}s`);
-    }
+    // Exit 124 is deliberately *not* turned into a failure. The contract puts
+    // command exit codes inside a successful execution response and reserves
+    // success:false for infrastructure faults, and a command may legitimately exit
+    // 124 itself. The `--verbose` diagnostic on stderr is what tells a reader a
+    // timeout fired.
     return result;
   }
 }
@@ -659,7 +722,7 @@ function containedCommand(params: { root: string; path: string; command: string;
     // never required here, and allowing it re-opens the swap-after-check window.
     `if [ -L "$__tfy_target" ]; then echo "path is a symlink" >&2; exit 77; fi`,
     'export __tfy_target',
-    `timeout ${String(params.timeoutSeconds)}s sh -c ${shellEscape(params.command)}`,
+    `timeout --verbose ${String(params.timeoutSeconds)}s sh -c ${shellEscape(params.command)}`,
   ].join('; ');
 }
 
@@ -685,6 +748,7 @@ async function runProcess(params: {
     let stdoutBytes = 0;
     let stderr = '';
     let timedOut = false;
+    let outputCapExceeded = false;
     let settled = false;
 
     const timer = setTimeout(() => {
@@ -695,6 +759,7 @@ async function runProcess(params: {
     child.stdout.on('data', (chunk: Buffer) => {
       stdoutBytes += chunk.length;
       if (params.maxStdoutBytes !== undefined && stdoutBytes > params.maxStdoutBytes) {
+        outputCapExceeded = true;
         child.kill('SIGKILL');
         return;
       }
@@ -724,6 +789,7 @@ async function runProcess(params: {
           stdout: Buffer.concat(stdoutChunks),
           stderr,
           timedOut,
+          outputCapExceeded,
         }),
       );
     });
