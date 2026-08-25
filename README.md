@@ -100,8 +100,35 @@ including for this project's own numbers.
 
 ## Qodo Code Review Evidence
 
-_Pending — this section will link the reviewed PRs and record how High-severity
-findings were resolved or dismissed._
+Every substantive change goes through a pull request reviewed by Qodo before merge.
+
+| PR | Findings | Resolution |
+| --- | --- | --- |
+| [#1](https://github.com/rycerzes/kernel-preflight/pull/1) — roofline auditor + container sandbox provider | 5 High, 3 Medium | 7 fixed, 1 partially fixed with a documented scope note. [Full response](https://github.com/rycerzes/kernel-preflight/pull/1#issuecomment-5414904562) |
+
+Findings were verified independently before being acted on, rather than accepted
+on the reviewer's word. Two of the eight needed the claim narrowed:
+
+- **Timeout leaves workload running** — real, and reproduced by hand
+  (`timeout 2s sh -c "sleep 120"` → exit 124 in 2.0s, workload gone from `ps`).
+  Fixed for the foreground workload; a deliberately detached child still outlives
+  the bound, because `timeout` signals its child and not the process group. That
+  residual is bounded by container removal and `reapStale`, and is documented at
+  the call site rather than papered over.
+- **Code mode admitted then crashes** — narrower than described, because
+  `Sandbox.ts` gates Code Mode lazily via `codeModeEnv`. The failure is now a
+  typed `CodeModeUnsupportedError`; full capability negotiation is out of scope
+  for this PR.
+
+The highest-impact finding was **cross-turn sandbox reuse**: the server builds a
+fresh provider per turn and hands it a sandbox id carried over from an earlier
+turn, so the original instance-local container map was empty exactly when it was
+needed. Container names are now derived from the sandbox id.
+
+Verifying the fixes also caught two bugs in the fixes themselves — a lookup left
+keyed on the wrong tuple field, and a regression test whose `grep` matched its own
+argv. Both are recorded in the PR response, because "the test passed" and "the fix
+works" are different claims.
 
 ## Notes
 
