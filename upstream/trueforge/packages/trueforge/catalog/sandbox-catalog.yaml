@@ -1,0 +1,15 @@
+# Shipped sandbox catalog: provider presets offered by
+# GET /api/v1/catalog/sandbox-providers for the UI to copy into
+# PUT /api/v1/settings/sandbox-providers bodies. Discovery-only — never executed against.
+providers:
+  - type: daytona
+    exec_timeout_ms: 60000
+    auto_stop_interval_in_minutes: 5
+    auto_archive_interval_in_minutes: 60
+    auto_delete_interval_in_minutes: 7200
+  - type: docker
+    # CUDA devel image: provides nvcc plus a POSIX shell. Swap for a slimmer
+    # image when the sandbox does not need to compile GPU code.
+    image: nvidia/cuda:13.0.0-devel-ubuntu24.04
+    exec_timeout_ms: 300000
+    gpus: all
