@@ -8,8 +8,20 @@ import { DockerSandboxProvider } from '../../../../../src/sandbox/docker/provide
 
 const IMAGE = process.env['TFY_DOCKER_SANDBOX_TEST_IMAGE'] ?? 'nvidia/cuda:13.0.0-base-ubuntu24.04';
 
-function newProvider(): DockerSandboxProvider {
-  return new DockerSandboxProvider({ image: IMAGE, logger: createLogger({ silent: true }) });
+/**
+ * Every provider in this suite gets a scope unique to the run. The reaper only
+ * removes containers in its own scope, so this suite cannot delete sandboxes
+ * belonging to another test worker or to a dev server on the same daemon.
+ */
+const TEST_SCOPE = `test-${String(process.pid)}-${String(Date.now())}`;
+
+function newProvider(overrides: { execTimeoutSeconds?: number } = {}): DockerSandboxProvider {
+  return new DockerSandboxProvider({
+    image: IMAGE,
+    scope: TEST_SCOPE,
+    logger: createLogger({ silent: true }),
+    ...overrides,
+  });
 }
 
 describe('DockerSandboxProvider hardening', () => {
@@ -126,11 +138,7 @@ describe('DockerSandboxProvider hardening', () => {
     // exits) still outlives the timeout, because `timeout` signals its own child
     // rather than the process group; those are bounded by container removal and
     // by reapStale rather than by this mechanism.
-    const provider = new DockerSandboxProvider({
-      image: IMAGE,
-      logger: createLogger({ silent: true }),
-      execTimeoutSeconds: 2,
-    });
+    const provider = newProvider({ execTimeoutSeconds: 2 });
     try {
       const { sandboxId } = await provider.createSandbox();
 
@@ -140,7 +148,14 @@ describe('DockerSandboxProvider hardening', () => {
 
       // Returned on the in-container bound, nowhere near the 120s the command asked for.
       expect(elapsed).toBeLessThan(30_000);
-      expect(result.success).toBe(false);
+      // A timeout is a command outcome, not an infrastructure fault, so it rides in
+      // a successful envelope carrying exit 124 plus `timeout --verbose`'s note.
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        throw new Error('unreachable');
+      }
+      expect(result.response.exitCode).toBe(124);
+      expect(result.response.result).toMatch(/timeout: sending signal/);
 
       // The workload itself is gone, not merely detached from its client.
       // The bracket idiom keeps the pattern from matching this command's own
@@ -160,27 +175,103 @@ describe('DockerSandboxProvider hardening', () => {
     }
   }, 180_000);
 
-  it('reaps stale labelled sandboxes without in-process bookkeeping', async () => {
+  it('refuses a cutoff that would mark live sandboxes stale', async () => {
+    await expect(
+      DockerSandboxProvider.reapStale({
+        scope: TEST_SCOPE,
+        olderThanMs: -1,
+        logger: createLogger({ silent: true }),
+      }),
+    ).rejects.toThrow(RangeError);
+  });
+
+  it('reaps only sandboxes in its own scope', async () => {
     if (!supported) {
       pending('no docker host');
       return;
     }
-    const provider = newProvider();
-    const { sandboxId } = await provider.createSandbox();
+    const mine = newProvider();
+    // Stands in for another server or test worker sharing the daemon. Its sandbox
+    // must survive a reap aimed at TEST_SCOPE.
+    const other = new DockerSandboxProvider({
+      image: IMAGE,
+      scope: `${TEST_SCOPE}-bystander`,
+      logger: createLogger({ silent: true }),
+    });
     try {
-      // olderThanMs: -1 treats everything as stale, which exercises the label
-      // lookup and removal path without waiting.
+      const { sandboxId } = await mine.createSandbox();
+      const bystander = await other.createSandbox();
+
       const { removed } = await DockerSandboxProvider.reapStale({
-        olderThanMs: -1,
+        scope: TEST_SCOPE,
+        olderThanMs: 0,
         logger: createLogger({ silent: true }),
       });
       expect(removed.length).toBeGreaterThan(0);
 
-      const afterReap = await provider.exec({ sandboxId, command: 'echo alive' });
-      // The container is gone, so the command must not succeed.
+      // Mine is gone...
+      const afterReap = await mine.exec({ sandboxId, command: 'echo alive' });
       if (afterReap.success) {
         expect(afterReap.response.exitCode).not.toBe(0);
       }
+
+      // ...and the bystander's is untouched.
+      const survived = await other.exec({ sandboxId: bystander.sandboxId, command: 'echo alive' });
+      expect(survived.success).toBe(true);
+      if (!survived.success) {
+        throw new Error('unreachable');
+      }
+      expect(survived.response.exitCode).toBe(0);
+    } finally {
+      await mine.dispose();
+      await other.dispose();
+    }
+  }, 240_000);
+
+  it('reports a command that exits 124 as itself, not as a timeout', async () => {
+    if (!supported) {
+      pending('no docker host');
+      return;
+    }
+    // GNU timeout exits 124 when it fires and also passes a command's own 124
+    // through, so status alone cannot tell them apart.
+    const provider = newProvider();
+    try {
+      const { sandboxId } = await provider.createSandbox();
+      const result = await provider.exec({ sandboxId, command: 'exit 124' });
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        throw new Error('unreachable');
+      }
+      expect(result.response.exitCode).toBe(124);
+      // No timeout diagnostic, because nothing timed out.
+      expect(result.response.result).not.toMatch(/timeout: sending signal/);
+    } finally {
+      await provider.dispose();
+    }
+  }, 180_000);
+
+  it('reports an oversized download as too large, not missing', async () => {
+    if (!supported) {
+      pending('no docker host');
+      return;
+    }
+    // Classification must survive both enforcement layers: the in-shell size
+    // check, and the streaming cap that catches a file growing mid-`cat`.
+    const provider = new DockerSandboxProvider({
+      image: IMAGE,
+      scope: TEST_SCOPE,
+      logger: createLogger({ silent: true }),
+      fileMaxBytesForDownload: 1024,
+    });
+    try {
+      const { sandboxId } = await provider.createSandbox();
+      const made = await provider.exec({ sandboxId, command: 'head -c 65536 /dev/zero > big.bin' });
+      expect(made.success).toBe(true);
+
+      await expect(provider.downloadFile({ sandboxId, path: 'big.bin' })).rejects.toThrow(
+        /too large|exceeds/i,
+      );
     } finally {
       await provider.dispose();
     }
