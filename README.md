@@ -77,7 +77,8 @@ Measured on an RTX 4090 (sm_89, driver 580.159.04, CUDA 13.2), not asserted:
 | Check | Result |
 | --- | --- |
 | TrueForge's own `sandboxProviderContractSuite` | 4/4, incl. sibling-escape isolation |
-| Full `packages/trueforge` unit suite after the union widening | 276 pass / 36 suites |
+| Docker provider suites (contract + GPU + hardening) | 16/16 |
+| Default `packages/trueforge` unit suite, unaffected | 273/273, 35 suites |
 | `nvidia-smi` inside the sandbox | RTX 4090 visible |
 | `nvcc -arch=sm_89` compile + run inside the sandbox | 921.2 / 1008.1 GB/s = 91.4% of peak |
 | 5 MiB upload/download round-trip | byte-exact |
@@ -102,9 +103,34 @@ including for this project's own numbers.
 
 Every substantive change goes through a pull request reviewed by Qodo before merge.
 
-| PR | Findings | Resolution |
+| Round | Findings | Resolution |
 | --- | --- | --- |
-| [#1](https://github.com/rycerzes/kernel-preflight/pull/1) — roofline auditor + container sandbox provider | 5 High, 3 Medium | 7 fixed, 1 partially fixed with a documented scope note. [Full response](https://github.com/rycerzes/kernel-preflight/pull/1#issuecomment-5414904562) |
+| [#1, first pass](https://github.com/rycerzes/kernel-preflight/pull/1) | 5 High, 3 Medium | 7 fixed, 1 partially fixed with a documented scope note. [Full response](https://github.com/rycerzes/kernel-preflight/pull/1#issuecomment-5414904562) |
+| [#1, review of the fixes](https://github.com/rycerzes/kernel-preflight/pull/1) | 1 High, 2 Medium | all 3 fixed |
+
+The second round reviewed the fixes themselves and found three second-order bugs,
+which is the review loop doing its job:
+
+- **Test deletes active sandboxes** (High) — the reaper test marked every labelled
+  container stale, so it would delete live sandboxes belonging to another test
+  worker or a running dev server on the same daemon. Fixed by making ownership
+  scoped: containers carry a scope label, `reapStale` requires one, and a negative
+  cutoff is now rejected outright. The regression test proves a bystander scope
+  survives a reap.
+- **Exit 124 conflated with timeout** (Medium) — GNU `timeout` exits 124 when it
+  fires *and* passes a command's own 124 straight through, confirmed by
+  experiment. Exit codes now ride in the successful envelope per the provider
+  contract, and `timeout --verbose` supplies the stderr diagnostic that
+  distinguishes a real timeout.
+- **Oversized download reported missing** (Medium) — collapsing the size check and
+  the read into one invocation removed a check/use window, but a file can still
+  grow mid-`cat`, making the streaming cap the last line of defence. It killed the
+  child without recording why, so an oversized file surfaced as missing.
+
+Checking that round also surfaced a packaging problem Qodo had not raised: the GPU
+test did not match upstream's `contract.test.ts$` ignore pattern, so it sat in the
+default unit run and would have failed on any machine without Docker. Renamed to
+follow the convention — infra-dependent tests are opt-in.
 
 Findings were verified independently before being acted on, rather than accepted
 on the reviewer's word. Two of the eight needed the claim narrowed:
