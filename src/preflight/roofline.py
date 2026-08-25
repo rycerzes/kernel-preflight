@@ -170,9 +170,17 @@ def audit(
         )
 
     ridge = ridge_point(device)
-    if ridge is None:
+    ceiling_unknown = ridge is None
+    if ceiling_unknown:
+        # Without a compute ceiling the ridge point is unknown, so we cannot tell
+        # whether this op is memory- or compute-bound. Auditing against the memory
+        # ceiling anyway is still *sound in one direction*: nothing can move bytes
+        # faster than the bus regardless of how much arithmetic it does. So a
+        # breach is still IMPOSSIBLE, but passing cannot be called PLAUSIBLE --
+        # a compute-bound claim could be impossible in a way we cannot see.
         bound = Bound.MEMORY
     else:
+        assert ridge is not None
         bound = Bound.MEMORY if op.arithmetic_intensity < ridge else Bound.COMPUTE
 
     if bound is Bound.MEMORY:
@@ -182,22 +190,9 @@ def audit(
         scale = 1e9
     else:
         peak_flops = device.peak_fp32_flops
-        if peak_flops is None:
-            return RooflineAudit(
-                op=op.name,
-                verdict=Verdict.UNVERIFIABLE,
-                bound=None,
-                seconds=seconds,
-                achieved_bytes_per_s=achieved_bytes_per_s,
-                achieved_flops=achieved_flops,
-                ceiling=0.0,
-                fraction_of_ceiling=None,
-                detail=(
-                    f"{op.name} is compute-bound but the FP32 ceiling for compute "
-                    f"capability {device.compute_capability} is unknown; refusing to "
-                    "audit against a fabricated number."
-                ),
-            )
+        # Unreachable: ridge_point() is None exactly when peak_fp32_flops is, and
+        # that path forces Bound.MEMORY above.
+        assert peak_flops is not None, "compute-bound with no compute ceiling"
         ceiling = peak_flops
         achieved = achieved_flops
         units = "TFLOP/s"
@@ -212,6 +207,15 @@ def audit(
             f"{ceiling / scale:.1f} {units} ({fraction:.1f}x the hardware maximum). "
             f"{device.name} physically cannot do this: the claim is a measurement "
             f"artefact or a benchmark exploit, not an optimisation."
+        )
+    elif ceiling_unknown:
+        # Sound-in-one-direction only: see the ceiling_unknown branch above.
+        verdict = Verdict.UNVERIFIABLE
+        detail = (
+            f"implies {achieved / scale:.1f} {units}, under the "
+            f"{ceiling / scale:.1f} {units} memory ceiling, but the FP32 ceiling for "
+            f"compute capability {device.compute_capability} is unknown. Cannot rule "
+            f"out a compute-bound impossibility, so this is not a pass."
         )
     elif fraction > implausible_fraction:
         verdict = Verdict.IMPLAUSIBLE

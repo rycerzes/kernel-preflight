@@ -25,9 +25,24 @@ _ATTR_SM_COUNT = 16
 _ATTR_MEMORY_CLOCK_KHZ = 36
 _ATTR_MEMORY_BUS_WIDTH_BITS = 37
 
-# FP32 lanes per SM. 128 on Ampere (8.x) and Ada (8.9) consumer parts; 64 on
-# Volta/Turing (7.x). Anything else refuses to guess -- see peak_fp32_flops.
-_FP32_LANES_PER_SM = {7: 64, 8: 128, 9: 128, 10: 128, 12: 128}
+# FP32 lanes per SM, keyed by full compute capability rather than major version.
+# Major alone is wrong: GA100 (8.0, the A100) has 64 FP32 lanes per SM, while the
+# GA10x consumer parts (8.6/8.7) and Ada (8.9) have 128. Keying on major would
+# double the A100's compute ceiling and weaken every gate that depends on it.
+#
+# Anything absent here refuses to guess -- see peak_fp32_flops.
+_FP32_LANES_PER_SM: dict[tuple[int, int], int] = {
+    (7, 0): 64,   # Volta  V100
+    (7, 2): 64,   # Xavier
+    (7, 5): 64,   # Turing T4, RTX 20xx
+    (8, 0): 64,   # Ampere GA100 (A100)
+    (8, 6): 128,  # Ampere GA10x (RTX 30xx, A40)
+    (8, 7): 128,  # Orin
+    (8, 9): 128,  # Ada    (RTX 40xx, L40S)
+    (9, 0): 128,  # Hopper H100
+    (10, 0): 128,  # Blackwell B100/B200
+    (12, 0): 128,  # Blackwell consumer (RTX 50xx)
+}
 
 
 class CudaDriverError(RuntimeError):
@@ -81,8 +96,12 @@ class DeviceSpec:
         Returning None forces callers to skip the compute-bound ceiling rather than
         silently audit against a fabricated number.
         """
-        major = int(self.compute_capability.split(".")[0])
-        lanes = _FP32_LANES_PER_SM.get(major)
+        major_text, _, minor_text = self.compute_capability.partition(".")
+        try:
+            capability = (int(major_text), int(minor_text))
+        except ValueError:
+            return None
+        lanes = _FP32_LANES_PER_SM.get(capability)
         if lanes is None:
             return None
         return self.sm_count * lanes * 2 * (self.sm_clock_khz * 1e3)
