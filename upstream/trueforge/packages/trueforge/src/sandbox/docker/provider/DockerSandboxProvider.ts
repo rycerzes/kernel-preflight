@@ -52,6 +52,23 @@ const DEFAULT_FILE_MAX_BYTES = 10 * 1024 * 1024;
 /** Cap for `docker version` / `docker image inspect` probes, not general exec. */
 const PROBE_TIMEOUT_MS = 10_000;
 const CONTAINER_NAME_PREFIX = 'tfy-sbx-';
+/** Slack between the in-container timeout and the outer client kill. */
+const OUTER_TIMEOUT_GRACE_MS = 10_000;
+/** Marks containers this provider owns, so stale ones can be found and reaped. */
+const OWNER_LABEL = 'com.truefoundry.trueforge.sandbox';
+/** Sandbox ids are ULIDs lowercased; anything else is not one of ours. */
+const SANDBOX_SLUG_RE = /^[0-9a-z]{26}$/;
+
+/**
+ * In-flight and failed image pulls, keyed by image reference.
+ *
+ * Deliberately module-scoped rather than per-instance: the server constructs a
+ * fresh provider for every turn (see `resolveSandboxProvider`), so instance state
+ * would make a pull started by the settings PUT invisible to the next caller,
+ * which would then start a second pull and never observe the first one's failure.
+ * Process-scoped is the correct lifetime for "is this image being fetched".
+ */
+const pullState = new Map<string, { inFlight: Promise<void> | undefined; failure: string | undefined }>();
 
 export interface DockerSandboxProviderOptions {
   /** Image the sandbox runs. Must provide a POSIX shell and `python3`. */
@@ -86,6 +103,21 @@ interface RunResult {
   timedOut: boolean;
 }
 
+/**
+ * Thrown when Code Mode is requested on a provider that has no transport for it.
+ * Typed so a caller can detect it and decline the capability, rather than having
+ * to string-match a generic Error at the point the agent already committed.
+ */
+export class CodeModeUnsupportedError extends Error {
+  readonly providerType: string;
+
+  constructor(providerType: string) {
+    super(`sandbox provider "${providerType}" does not support Code Mode`);
+    this.name = 'CodeModeUnsupportedError';
+    this.providerType = providerType;
+  }
+}
+
 export class DockerSandboxProvider implements SandboxProvider {
   readonly type = 'docker';
 
@@ -97,12 +129,12 @@ export class DockerSandboxProvider implements SandboxProvider {
   private readonly extraRunArgs: readonly string[];
   private readonly logger: Logger;
 
-  /** sandboxId (in-container path) -> container name. */
-  private readonly containers = new Map<string, string>();
-  /** Set while a background `docker pull` is running; cleared when it settles. */
-  private pullInFlight: Promise<void> | undefined;
-  /** Reason the last background pull failed, surfaced by getImageBuildStatus. */
-  private pullFailure: string | undefined;
+  /**
+   * Sandbox ids created by *this* instance, for `dispose()` only. It is not a
+   * lookup table: the container name is derived from the sandbox id, so a
+   * provider built in a later turn can still address a sandbox it did not create.
+   */
+  private readonly ownCreations = new Set<string>();
 
   private static readonly readyBuild: SandboxBuild = { status: 'ready', reason: null, metadata: null };
 
@@ -148,24 +180,26 @@ export class DockerSandboxProvider implements SandboxProvider {
     if (await this.imagePresent()) {
       return DockerSandboxProvider.readyBuild;
     }
-    if (this.pullInFlight === undefined) {
-      this.pullFailure = undefined;
-      this.pullInFlight = runProcess({
+    const state = pullState.get(this.image) ?? { inFlight: undefined, failure: undefined };
+    if (state.inFlight === undefined) {
+      state.failure = undefined;
+      state.inFlight = runProcess({
         file: this.dockerBinary,
         args: ['pull', this.image],
         timeoutMs: 60 * 60_000,
       })
         .then((pull) => {
           if (pull.exitCode !== 0) {
-            this.pullFailure = pull.stderr.trim() || `exit ${String(pull.exitCode)}`;
+            state.failure = pull.stderr.trim() || `exit ${String(pull.exitCode)}`;
           }
         })
         .catch((error: unknown) => {
-          this.pullFailure = errorMessage(error);
+          state.failure = errorMessage(error);
         })
         .finally(() => {
-          this.pullInFlight = undefined;
+          state.inFlight = undefined;
         });
+      pullState.set(this.image, state);
       this.logger.info('DockerSandboxProvider started image pull', { image: this.image });
     }
     return { status: 'pending', reason: `pulling ${this.image}`, metadata: { image: this.image } };
@@ -175,13 +209,14 @@ export class DockerSandboxProvider implements SandboxProvider {
     if (await this.imagePresent()) {
       return DockerSandboxProvider.readyBuild;
     }
-    if (this.pullInFlight !== undefined) {
+    const state = pullState.get(this.image);
+    if (state?.inFlight !== undefined) {
       return { status: 'pending', reason: `pulling ${this.image}`, metadata: { image: this.image } };
     }
-    if (this.pullFailure !== undefined) {
+    if (state?.failure !== undefined) {
       return {
         status: 'failed',
-        reason: `failed to pull ${this.image}: ${this.pullFailure}`,
+        reason: `failed to pull ${this.image}: ${state.failure}`,
         metadata: { image: this.image },
       };
     }
@@ -212,6 +247,10 @@ export class DockerSandboxProvider implements SandboxProvider {
       '--init',
       '--workdir',
       sandboxId,
+      // Ownership marker so stale sandboxes can be found and reaped without
+      // relying on any process having kept a handle to them.
+      '--label',
+      `${OWNER_LABEL}=1`,
       ...(this.gpus === undefined ? [] : ['--gpus', this.gpus]),
       ...this.extraRunArgs,
       this.image,
@@ -226,7 +265,7 @@ export class DockerSandboxProvider implements SandboxProvider {
       );
     }
 
-    this.containers.set(sandboxId, containerName);
+    this.ownCreations.add(sandboxId);
 
     // `--workdir` creates the directory, but the layout subdirectories and the
     // venv do not exist yet. Failure here must not leak the container.
@@ -329,56 +368,65 @@ export class DockerSandboxProvider implements SandboxProvider {
     const containerName = this.requireContainer(params.sandboxId);
     const absolutePath = this.resolveInSandboxRoot(params.sandboxId, params.path);
 
-    // Classify before transferring so the caller gets the specific error rather
-    // than a shell diagnostic on stderr.
-    const stat = await this.execInContainer({
-      containerName,
-      command: `if [ -d ${shellEscape(absolutePath)} ]; then echo DIR; elif [ -f ${shellEscape(absolutePath)} ]; then wc -c < ${shellEscape(absolutePath)}; else echo MISSING; fi`,
-      cwd: params.sandboxId,
-      timeoutSeconds: this.execTimeoutSeconds,
-    });
-    const verdict = stat.stdout.toString('utf8').trim();
-    if (stat.exitCode !== 0 || verdict === 'MISSING') {
-      throw new SandboxFileNotFoundError(params.path);
-    }
-    if (verdict === 'DIR') {
-      throw new SandboxPathIsDirectoryError(params.path);
-    }
-    const size = Number.parseInt(verdict, 10);
-    if (Number.isNaN(size)) {
-      throw new SandboxFileNotFoundError(params.path);
-    }
-    if (size > this.fileMaxBytesForDownload) {
-      throw new SandboxFileTooLargeError(params.path, size, this.fileMaxBytesForDownload);
-    }
-
+    // Classification and read happen in one invocation. Two `docker exec` calls
+    // would leave a window in which the path could be swapped for a symlink
+    // between the check and the read. Distinct exit codes carry the error kind
+    // back, so stdout stays pure file bytes.
     const read = await this.execInContainer({
       containerName,
-      command: `cat ${shellEscape(absolutePath)}`,
+      command: containedCommand({
+        root: params.sandboxId,
+        path: absolutePath,
+        timeoutSeconds: this.execTimeoutSeconds,
+        command: [
+          'if [ -d "$__tfy_target" ]; then exit 78; fi',
+          'if [ ! -f "$__tfy_target" ]; then exit 79; fi',
+          `if [ "$(wc -c < "$__tfy_target")" -gt ${String(this.fileMaxBytesForDownload)} ]; then exit 80; fi`,
+          'cat "$__tfy_target"',
+        ].join('; '),
+      }),
       cwd: params.sandboxId,
       timeoutSeconds: this.execTimeoutSeconds,
       maxStdoutBytes: this.fileMaxBytesForDownload,
+      raw: true,
     });
-    if (read.exitCode !== 0) {
-      throw new SandboxFileNotFoundError(params.path);
+
+    switch (read.exitCode) {
+      case 0:
+        return read.stdout;
+      case 78:
+        throw new SandboxPathIsDirectoryError(params.path);
+      case 80:
+        throw new SandboxFileTooLargeError(params.path, this.fileMaxBytesForDownload + 1, this.fileMaxBytesForDownload);
+      case CONTAINMENT_VIOLATION_EXIT:
+      case 79:
+      default:
+        throw new SandboxFileNotFoundError(params.path);
     }
-    return read.stdout;
   }
 
   async uploadFile(params: { sandboxId: string; remotePath: string; content: Buffer }): Promise<void> {
     const containerName = this.requireContainer(params.sandboxId);
     const absolutePath = this.resolveInSandboxRoot(params.sandboxId, params.remotePath);
-    const parent = posix.dirname(absolutePath);
 
     // Payload travels on stdin. Encoding it into the command string would cap
     // uploads at roughly 96 KiB (MAX_ARG_STRLEN); see upstream issue #416.
     const result = await this.execInContainer({
       containerName,
-      command: `mkdir -p ${shellEscape(parent)} && cat > ${shellEscape(absolutePath)}`,
+      command: containedCommand({
+        root: params.sandboxId,
+        path: absolutePath,
+        timeoutSeconds: this.execTimeoutSeconds,
+        command: 'mkdir -p "$(dirname "$__tfy_target")" && cat > "$__tfy_target"',
+      }),
       cwd: params.sandboxId,
       timeoutSeconds: this.execTimeoutSeconds,
       stdin: params.content,
+      raw: true,
     });
+    if (result.exitCode === CONTAINMENT_VIOLATION_EXIT) {
+      throw new SandboxFileNotFoundError(params.remotePath);
+    }
     if (result.exitCode !== 0) {
       throw new Error(`upload to ${params.remotePath} failed: ${result.stderr.trim() || 'no stderr'}`);
     }
@@ -391,34 +439,112 @@ export class DockerSandboxProvider implements SandboxProvider {
    * transport choice, so it throws rather than half-working.
    */
   createCodeModeTransport(): CodeModeTransport {
-    throw new Error('DockerSandboxProvider does not support Code Mode yet');
+    throw new CodeModeUnsupportedError(this.type);
   }
 
-  /** Removes every container this provider started. Safe to call twice. */
+  /** Removes containers this instance started. Safe to call twice. */
   async dispose(): Promise<void> {
-    const ids = [...this.containers.keys()];
+    const ids = [...this.ownCreations];
     await Promise.all(ids.map(async (id) => this.removeContainer(id).catch(() => undefined)));
   }
 
-  private async removeContainer(sandboxId: string): Promise<void> {
-    const containerName = this.containers.get(sandboxId);
-    if (containerName === undefined) {
-      return;
+  /**
+   * Removes sandbox containers created more than `olderThanMs` ago.
+   *
+   * `dispose()` alone is not enough: the server builds a fresh provider per turn
+   * and never disposes it, so nothing would ever clean up. Ownership is recovered
+   * from the container label rather than in-process bookkeeping, which also
+   * reclaims sandboxes orphaned by a server restart or crash.
+   */
+  static async reapStale(params: {
+    olderThanMs: number;
+    logger: Logger;
+    dockerBinary?: string;
+  }): Promise<{ removed: string[] }> {
+    const docker = params.dockerBinary ?? 'docker';
+    const listed = await runProcess({
+      file: docker,
+      args: ['ps', '--all', '--filter', `label=${OWNER_LABEL}`, '--format', '{{.Names}}'],
+      timeoutMs: PROBE_TIMEOUT_MS,
+    }).catch(() => undefined);
+    if (listed === undefined || listed.exitCode !== 0) {
+      return { removed: [] };
     }
-    this.containers.delete(sandboxId);
+    const names = listed.stdout
+      .toString('utf8')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    if (names.length === 0) {
+      return { removed: [] };
+    }
+
+    // `docker ps --format {{.CreatedAt}}` emits e.g. "2026-08-25 23:59:01 +0530 IST",
+    // which Date.parse rejects as NaN. `inspect .Created` is RFC 3339 instead.
+    const inspected = await runProcess({
+      file: docker,
+      args: ['inspect', '--format', '{{.Name}}\t{{.Created}}', ...names],
+      timeoutMs: PROBE_TIMEOUT_MS,
+    }).catch(() => undefined);
+    if (inspected === undefined || inspected.exitCode !== 0) {
+      return { removed: [] };
+    }
+
+    const cutoff = Date.now() - params.olderThanMs;
+    const stale: string[] = [];
+    for (const line of inspected.stdout.toString('utf8').split('\n')) {
+      const [rawName, createdAt] = line.split('\t');
+      if (rawName === undefined || createdAt === undefined) {
+        continue;
+      }
+      // `.Name` comes back with a leading slash.
+      const name = rawName.trim().replace(/^\//, '');
+      if (name.length === 0) {
+        continue;
+      }
+      const created = Date.parse(createdAt.trim());
+      // An unparseable timestamp must not be read as "ancient" — skip it rather
+      // than delete a container that might be in use.
+      if (Number.isNaN(created) || created >= cutoff) {
+        continue;
+      }
+      stale.push(name);
+    }
+
+    await Promise.all(
+      stale.map(async (name) =>
+        runProcess({
+          file: docker,
+          args: ['rm', '--force', '--volumes', name],
+          timeoutMs: 60_000,
+        }).catch(() => undefined),
+      ),
+    );
+    if (stale.length > 0) {
+      params.logger.info('DockerSandboxProvider reaped stale sandboxes', { count: stale.length });
+    }
+    return { removed: stale };
+  }
+
+  private async removeContainer(sandboxId: string): Promise<void> {
+    this.ownCreations.delete(sandboxId);
     await runProcess({
       file: this.dockerBinary,
-      args: ['rm', '--force', '--volumes', containerName],
+      args: ['rm', '--force', '--volumes', containerNameFor(sandboxId)],
       timeoutMs: 60_000,
     });
   }
 
+  /**
+   * Container name for a sandbox id, derived rather than looked up.
+   *
+   * The server constructs a new provider for every turn and then hands it a
+   * sandbox id carried over from a previous turn, so any in-instance map would be
+   * empty exactly when it was needed. Deriving the name makes a sandbox
+   * addressable by any provider instance pointed at the same daemon.
+   */
   private requireContainer(sandboxId: string): string {
-    const containerName = this.containers.get(sandboxId);
-    if (containerName === undefined) {
-      throw new SandboxNotAvailableError(`unknown sandbox ${sandboxId}`);
-    }
-    return containerName;
+    return containerNameFor(sandboxId);
   }
 
   /**
@@ -446,6 +572,8 @@ export class DockerSandboxProvider implements SandboxProvider {
     timeoutSeconds: number;
     stdin?: Buffer;
     maxStdoutBytes?: number;
+    /** Command already carries its own in-container `timeout`; do not add one. */
+    raw?: boolean;
   }): Promise<RunResult> {
     const args = ['exec', '--workdir', params.cwd];
     if (params.stdin !== undefined) {
@@ -454,16 +582,33 @@ export class DockerSandboxProvider implements SandboxProvider {
     for (const [key, value] of Object.entries(params.env ?? {})) {
       args.push('--env', `${key}=${value}`);
     }
-    args.push(params.containerName, 'sh', '-c', params.command);
+    // Killing the local `docker exec` client does not kill the process inside the
+    // container (runc#3359), so the bound has to be applied in there too. The
+    // outer kill below remains as a backstop for a wedged daemon connection.
+    const command =
+      params.raw === true
+        ? params.command
+        : `timeout ${String(params.timeoutSeconds)}s sh -c ${shellEscape(params.command)}`;
+    args.push(params.containerName, 'sh', '-c', command);
 
     const result = await runProcess({
       file: this.dockerBinary,
       args,
-      timeoutMs: params.timeoutSeconds * 1000,
+      // Grace margin so the in-container `timeout` fires first and the workload is
+      // actually killed. If the outer bound won the race we would kill the client
+      // and leave the command running.
+      timeoutMs: params.timeoutSeconds * 1000 + OUTER_TIMEOUT_GRACE_MS,
       ...(params.stdin === undefined ? {} : { stdin: params.stdin }),
       ...(params.maxStdoutBytes === undefined ? {} : { maxStdoutBytes: params.maxStdoutBytes }),
     });
     if (result.timedOut) {
+      throw new Error(
+        `command exceeded ${String(params.timeoutSeconds)}s and the container-side timeout did not fire; ` +
+          'the docker daemon connection may be wedged',
+      );
+    }
+    // 124 is `timeout`'s exit status when it killed the command.
+    if (result.exitCode === 124 && params.raw !== true) {
       throw new Error(`command timed out after ${String(params.timeoutSeconds)}s`);
     }
     return result;
@@ -473,6 +618,53 @@ export class DockerSandboxProvider implements SandboxProvider {
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+/**
+ * Derives the container name from a sandbox id. Validates the shape rather than
+ * trusting it: the id reaches us from persisted session state, and it is about to
+ * become a `docker` argument.
+ */
+function containerNameFor(sandboxId: string): string {
+  const parent = posix.dirname(sandboxId);
+  const slug = posix.basename(sandboxId);
+  if (parent !== SANDBOX_PARENT || !SANDBOX_SLUG_RE.test(slug)) {
+    throw new SandboxNotAvailableError(`not a docker sandbox id: ${sandboxId}`);
+  }
+  return `${CONTAINER_NAME_PREFIX}${slug}`;
+}
+
+/**
+ * Wraps a command so it is confined to `root` and, on timeout, actually dies.
+ *
+ * Two problems are solved in one shell invocation:
+ *
+ * 1. Symlink escape. Lexical containment on the host cannot see that
+ *    `<root>/link` is a symlink to `/etc/shadow`; `realpath` resolves it and the
+ *    prefix is rechecked against the resolved target. Doing the check and the
+ *    operation in one invocation also removes the check/use window that two
+ *    separate `docker exec` calls would leave open.
+ * 2. Runaway workloads. Killing the local `docker exec` client does not kill the
+ *    process inside the container (runc#3359), so the timeout is applied by
+ *    `timeout` *inside* the container as well.
+ */
+function containedCommand(params: { root: string; path: string; command: string; timeoutSeconds: number }): string {
+  return [
+    `__tfy_root=${shellEscape(params.root)}`,
+    // `-m` allows a not-yet-existing final component (uploads) while still
+    // resolving symlinks in every component that does exist.
+    `__tfy_target=$(realpath -m -- ${shellEscape(params.path)})`,
+    // Quoted variable in the pattern compares literally, not as a glob.
+    `case "$__tfy_target" in "$__tfy_root"/*) ;; *) echo "path escapes sandbox root" >&2; exit 77 ;; esac`,
+    // Refuse a symlink even when it resolves inside the root: following one is
+    // never required here, and allowing it re-opens the swap-after-check window.
+    `if [ -L "$__tfy_target" ]; then echo "path is a symlink" >&2; exit 77; fi`,
+    'export __tfy_target',
+    `timeout ${String(params.timeoutSeconds)}s sh -c ${shellEscape(params.command)}`,
+  ].join('; ');
+}
+
+/** Exit status used by {@link containedCommand} when a path leaves the sandbox. */
+const CONTAINMENT_VIOLATION_EXIT = 77;
 
 /**
  * Spawn a process, collecting stdout as bytes. stdout stays a Buffer because
