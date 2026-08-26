@@ -107,6 +107,7 @@ Every substantive change goes through a pull request reviewed by Qodo before mer
 | --- | --- | --- |
 | [#1, first pass](https://github.com/rycerzes/kernel-preflight/pull/1) | 5 High, 3 Medium | 7 fixed, 1 partially fixed with a documented scope note. [Full response](https://github.com/rycerzes/kernel-preflight/pull/1#issuecomment-5414904562) |
 | [#1, review of the fixes](https://github.com/rycerzes/kernel-preflight/pull/1) | 1 High, 2 Medium | all 3 fixed |
+| [#2, preflight agent](https://github.com/rycerzes/kernel-preflight/pull/2) | 6 findings | all 6 fixed. [Full response](https://github.com/rycerzes/kernel-preflight/pull/2#issuecomment-5420739404) |
 
 The second round reviewed the fixes themselves and found three second-order bugs,
 which is the review loop doing its job:
@@ -155,6 +156,28 @@ Verifying the fixes also caught two bugs in the fixes themselves — a lookup le
 keyed on the wrong tuple field, and a regression test whose `grep` matched its own
 argv. Both are recorded in the PR response, because "the test passed" and "the fix
 works" are different claims.
+
+### The finding that invalidated the premise
+
+Review of the agent PR found that a candidate could **forge its own verdict**. The
+harness prints its measurement, but the candidate is linked into the same binary
+and C++ static constructors run before `main`. A kernel with an empty body, whose
+constructor printed a fabricated measurement and exited, was **admitted at a
+plausible 91% of peak** — six gates, all green, for code that never launched
+anything.
+
+That is not a bug in a gate. It falsified the sentence at the top of this file.
+
+It is fixed by refusing to take stdout at face value: the harness must echo a
+nonce chosen after the candidate's source was fixed, and must account for
+wall-clock time the caller independently observed. Fabricated work cannot pay for
+time that never elapsed. The attack is committed as
+`src/preflight/harness/examples/cheat_forge.cu` so it stays a regression test.
+
+The same review found that candidate code was being compiled and executed **on the
+host**, in the process environment holding the publishing token — while this
+repository was contributing a GPU container sandbox to TrueForge. Execution now
+happens in a container with no network and no inherited environment.
 
 ## Notes
 
