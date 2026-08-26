@@ -125,7 +125,7 @@ bandwidth kernel measures against the same figure.
 
 ### The kernel matrix
 
-27 cases in one session on one GPU, with a thermal cooldown between each so the
+28 cases in one session on one GPU, with a thermal cooldown between each so the
 figures are comparable — `benchmark/full_matrix.py`. A sweep run straight after
 Helion's autotuner once read a third of the throughput of the same kernel idle,
 which is why Helion is scheduled last and why the harness samples the SM clock and
