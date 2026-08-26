@@ -9,9 +9,9 @@ not catch it: a kernel can be numerically perfect and still be timed dishonestly
 This project treats the agent's performance claims as untrusted, checks them
 against the hardware's physical limits, and puts a human in front of publication.
 
-**Status: in progress.** The sandbox provider and the physics gate are built and
-tested. The agent loop is not finished yet. See [Verified](#verified) for exactly
-what has been measured rather than asserted.
+**Status: working end to end.** The agent reads a skill, drafts in a GPU sandbox,
+submits to the gates and stops for approval before publishing. See
+[Verified](#verified) for what has been measured rather than asserted.
 
 ## Why
 
@@ -48,20 +48,33 @@ the Hub, rather than scoring a benchmark offline.
 
 ```
 TrueForge  (on the GPU host)
-└── DockerSandboxProvider           new; upstream/
-      • docker run --gpus all
-      • nvcc + torch inside the sandbox
-            │
-            ▼
-      preflight gates
-      • physics    claim vs driver-reported hardware ceiling
-      • liveness   did the kernel write its output at all
-      • sync       is the timed region actually synchronised
-      • variance   repeated runs, not one sample
-            │
-            ▼
-      human approval  ──▶  publish to the HF Hub
+├── DockerSandboxProvider ──── the agent's workspace: GPU, nvcc, skills
+│                              (new; contributed in upstream/)
+└── MCP: kernel-preflight ──── the adjudicator, outside the agent's control
+      ├── device_spec          hardware ceilings from the CUDA driver
+      ├── preflight_kernel     compile → measure → gate, in isolation
+      └── publish_kernel       approval-gated; re-verifies before publishing
 ```
+
+**The agent submits source and never submits a number.** A candidate is compiled
+*into* a fixed harness it cannot see or modify, which owns the allocation, the
+input distribution, the timing loop, the reference and the tolerances. The
+documented ways of faking a kernel speedup are all properties of measurement code;
+making that code ours does not detect them, it makes them unrepresentable.
+
+The gates:
+
+| gate | catches |
+| --- | --- |
+| `wellformed` | the measurement did not come from the harness |
+| `provenance` | the result was fabricated before the harness ran |
+| `correctness` | it does not compute the operation |
+| `timed_work` | it computed during warmup and skipped the measured calls |
+| `liveness` | it never wrote the output — instant, and otherwise brilliant |
+| `input_sensitivity` | it writes a constant, ignoring its input |
+| `shape_consistency` | it is tuned to one shape, i.e. a lookup table |
+| `variance` | the timing is too unstable to mean anything |
+| `roofline` | the implied throughput is physically impossible |
 
 The sandbox has to hold the GPU, because a performance claim measured somewhere
 other than where the kernel runs is not a measurement. TrueForge's existing
@@ -82,6 +95,8 @@ Measured on an RTX 4090 (sm_89, driver 580.159.04, CUDA 13.2), not asserted:
 | `nvidia-smi` inside the sandbox | RTX 4090 visible |
 | `nvcc -arch=sm_89` compile + run inside the sandbox | 921.2 / 1008.1 GB/s = 91.4% of peak |
 | 5 MiB upload/download round-trip | byte-exact |
+| Agent end to end: skill → sandbox → gates | admitted at 91.1% of DRAM peak, first submission |
+| Adversarial kernels (`noop`, `cached`, `forge`) | all three rejected, each by a different gate |
 
 The device ceiling is corroborated two ways: `preflight.device` derives
 **1008.1 GB/s** from the CUDA driver attribute API, and an independent CUDA C
@@ -95,7 +110,10 @@ including for this project's own numbers.
 
 | Path | Contents |
 | --- | --- |
-| `src/preflight/` | the gates. `device.py` reads hardware ceilings, `roofline.py` grades claims |
+| `src/preflight/` | `harness/driver.cu` measures, `gates.py` adjudicates, `runner.py` isolates, `mcp_server.py` serves |
+| `src/preflight/harness/examples/` | a baseline and three adversarial kernels, kept as regression tests |
+| `agent/` | the saved TrueForge agent manifest |
+| `docker/` | the sandbox image: CUDA plus the Python the bootstrap needs |
 | `upstream/trueforge/` | changes to TrueForge itself, mirroring upstream paths for a clean PR |
 | `docs/` | investigation notes |
 
