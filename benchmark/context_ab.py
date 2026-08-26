@@ -101,9 +101,20 @@ class Arm:
     def admitted_rate(self) -> float:
         return sum(t.admitted for t in self.trials) / len(self.trials) if self.trials else 0.0
 
+    @property
+    def completed_trials(self) -> list[Trial]:
+        return [t for t in self.trials if t.completed]
+
     def median(self, attr: str) -> float:
-        values = [getattr(t, attr) for t in self.trials]
-        return statistics.median(values) if values else 0.0
+        """Median over completed trials only.
+
+        A failed trial records zero tokens and a truncated wall time. Including
+        those would make a *worse* arm look cheaper and faster, which inverts the
+        thing being measured. Completion rate is reported separately and is where
+        failures belong.
+        """
+        values = [getattr(t, attr) for t in self.completed_trials]
+        return statistics.median(values) if values else float("nan")
 
 
 def run_trial(arm: str, managed: bool) -> Trial:
@@ -204,14 +215,16 @@ def main() -> None:
             )
 
     print("\n" + "=" * 72)
-    print(f"{'arm':<10}{'completed':>11}{'admitted':>10}{'med tokens':>12}{'med input':>11}{'med wall':>10}")
+    print(f"{'arm':<10}{'completed':>11}{'admitted':>10}{'n':>4}{'med tokens':>12}{'med input':>11}{'med wall':>10}")
     print("=" * 72)
     for arm in arms.values():
         print(
             f"{arm.name:<10}{arm.completion_rate:>10.0%}{arm.admitted_rate:>10.0%}"
+            f"{len(arm.completed_trials):>4}"
             f"{arm.median('total_tokens'):>12,.0f}{arm.median('input_tokens'):>11,.0f}"
             f"{arm.median('wall_s'):>9.0f}s"
         )
+    print("\nMedians are over completed trials only; n is that count.")
 
     payload = {
         "task": TASK,
@@ -220,6 +233,7 @@ def main() -> None:
             name: {
                 "completion_rate": arm.completion_rate,
                 "admitted_rate": arm.admitted_rate,
+                "completed_trials": len(arm.completed_trials),
                 "median_total_tokens": arm.median("total_tokens"),
                 "median_input_tokens": arm.median("input_tokens"),
                 "median_wall_s": arm.median("wall_s"),

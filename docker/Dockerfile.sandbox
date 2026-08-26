@@ -20,4 +20,11 @@ RUN pip3 install --no-cache-dir --break-system-packages pydantic==2.12.5
 # The bootstrap invokes `python`, not just `python3`.
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python
 
+# The NVIDIA base image ships an entrypoint that prints a licence banner on
+# stdout. The preflight harness communicates over stdout in JSON and the reader
+# parses it strictly, so that banner turns every measurement into a parse error.
+# Clearing the entrypoint removes the noise at the source rather than loosening
+# the parser, which would also accept a candidate's own stdout junk.
+ENTRYPOINT []
+
 CMD ["sleep", "infinity"]

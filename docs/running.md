@@ -105,3 +105,32 @@ the gates currently answer only the second. Comparing variants honestly needs
 repeated independent runs per variant and a confidence interval on the
 difference. Until that exists, treat the fan-out as a way to explore the design
 space in parallel, not as a way to pick a winner by a fraction of a percent.
+
+## Context-management A/B: a negative result
+
+`benchmark/context_ab.py`, four trials per arm, arm order alternating:
+
+| arm | completed | admitted | median tokens | median input | median wall |
+| --- | --- | --- | --- | --- | --- |
+| managed | 100% | 100% | 87,311 | 84,198 | 65s |
+| raw | 100% | 100% | 58,504 | 56,219 | 55s |
+
+Compaction and large-response offload cost **~49% more tokens** on this task and
+finished slower. Every trial in both arms completed and was admitted, so this is
+not a reliability trade being paid for in tokens — it is pure overhead here.
+
+This is the wrong regime for the feature, not evidence the feature is broken. The
+task's input sits around 56k tokens without management; the compaction threshold
+is 50k, so compaction fires and pays for an extra summarising model call, while
+offload converts one large tool result into a sandbox write plus follow-up reads.
+Both costs land, and the run ends before either can amortise.
+
+It does not contradict TrueForge's published figures, which came from
+Enterprise-Bench across three MCP servers — a far longer, more tool-heavy
+workload where a context window would actually be exhausted. It qualifies *when*
+the machinery pays for itself, which is a more useful claim than a percentage.
+
+Demonstrating the benefit needs a task that would otherwise overflow: many more
+iterations, several skills, or a much larger operator set. That measurement is
+not in this repository yet, and the honest summary is that on a task this size
+you should leave context management off.
