@@ -131,7 +131,7 @@ Helion's autotuner once read a third of the throughput of the same kernel idle,
 which is why Helion is scheduled last and why the harness samples the SM clock and
 says so when it ran below peak.
 
-**17 admitted, 10 not, and every one of the 7 adversarial candidates rejected.**
+**17 admitted, 11 not, and every one of the 8 adversarial candidates rejected.**
 
 One op, five toolchains — the comparison the gates are indifferent to, because they
 adjudicate a measurement schema rather than a toolchain:
@@ -139,29 +139,44 @@ adjudicate a measurement schema rather than a toolchain:
 | rmsnorm | fp32, % of the 1008.1 GB/s bus |
 | --- | --- |
 | hand-written CUDA | 90.1% |
-| TileLang | 90.5% |
-| Helion (autotuned) | 89.2% |
+| TileLang | 90.7% |
 | Triton | 89.6% |
-| CuTe DSL, one warp per row | 56.7% |
-| eager PyTorch | 26.1% |
+| Helion (autotuned) | 89.1% |
+| CuTe DSL, one warp per row | 56.4% |
+| eager PyTorch | 26.2% |
 
-Memory-bound, other ops: CUDA softmax 89.9%, CUDA silu 91.3%, TileLang silu 90.7%,
-CuTe silu 88.6%, CUDA transpose 30.5%.
+Memory-bound, other ops: CUDA softmax 90.2%, CUDA silu 91.2%, TileLang silu 90.6%,
+CuTe silu 88.6%, CUDA transpose 30.4%.
 
 Compute-bound, audited against the arithmetic ceiling rather than the bus:
 
 | kernel | declared | verdict |
 | --- | --- | --- |
-| Triton matmul, `input_precision="ieee"` | fp32 | 58.0% of fp32 pipelines |
+| Triton matmul, `input_precision="ieee"` | fp32 | 58.2% of fp32 pipelines |
 | Triton matmul, TF32 | fp32 | **rejected** — correctness, timed_work |
-| the same TF32 kernel | tf32 | 91.9% of tf32 pipelines |
+| the same TF32 kernel | tf32 | 89.2% of tf32 pipelines |
 | torch SDPA | fp32 | 29.2% |
-| torch SDPA | bf16 | 87.4% |
+| torch SDPA | bf16 | 93.1% |
 | Triton FlashAttention | fp32 | **rejected** — correctness, timed_work |
-| the same kernel | tf32 | 83.5% |
-| the same kernel | bf16 | 84.7% |
+| the same kernel | tf32 | 76.7% |
+| the same kernel | bf16 | 88.9% |
 
-### Four results worth reading
+Two independent sweeps of this matrix agree to within **0.3 points** on every
+memory-bound case and disagree by up to **6.8 points** on the compute-bound
+attention ones, which pick a different winning shape from run to run. That gap is
+the argument for `variance` being a gate rather than a note, and it is the reason a
+single number from a single run is not evidence — including for the numbers above.
+
+### Five results worth reading
+
+**One true value passes a check built to need the whole output.** `timed_work`
+exists to prove the *measured* calls did the work, and it asks two things: that
+something was written, and that what was written matches. Both are satisfiable by a
+single element, because the error is computed over the finite elements only — a NaN
+has no distance from anything. A candidate that computed correctly through warmup
+and then wrote one true value with NaN everywhere else, on every timed call, was
+admitted with all nine gates green. Both harnesses were already computing the flag
+that catches it and throwing it away.
 
 **Physics disproves a precision claim without needing the reference.**
 `cheat_silent_bf16.py` declares fp32 and quietly computes in bf16. It is caught
@@ -248,8 +263,8 @@ and it is not done.
 | `src/preflight/runner.py` | isolation: container, no network, no inherited environment |
 | `src/preflight/mcp_server.py` | the three tools TrueForge sees |
 | `src/preflight/device.py` | hardware ceilings read from the CUDA driver attribute API |
-| `src/preflight/harness/examples/` | 17 honest kernels across five toolchains, 7 adversarial, 1 merely wrong — all regression tests |
-| `benchmark/full_matrix.py` | the 27-case sweep behind the table above |
+| `src/preflight/harness/examples/` | 17 honest kernels across five toolchains, 8 adversarial, 1 merely wrong — all regression tests |
+| `benchmark/full_matrix.py` | the 28-case sweep behind the table above |
 | `tests/` | 35 gate tests, including the ones that fail against the pre-fix code |
 | `agent/` | the saved TrueForge agent manifest |
 | `docker/` | the sandbox images: CUDA, plus torch/Triton/Helion/CuTe/TileLang |
