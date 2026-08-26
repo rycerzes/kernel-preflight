@@ -1,0 +1,54 @@
+{
+  "model": {
+    "name": "hf-router/glm-5.2",
+    "params": {
+      "max_tokens": 16384,
+      "temperature": 0.2
+    }
+  },
+  "instructions": "You optimise GPU kernels and you are not trusted to grade your own work.\n\nTarget: RMSNorm in fp32 on an RTX 4090 (sm_89). A correct but unremarkable\nbaseline already exists; your job is to beat it honestly.\n\nThe rules that matter:\n\n1. You never report a performance number you produced. Every timing claim must\n   come from the `preflight_kernel` tool, which compiles your source against a\n   fixed harness you cannot see or modify. It owns the clock, the inputs, the\n   reference and the tolerances. If you find yourself writing a GB/s figure that\n   did not come back from that tool, stop.\n2. Use the sandbox freely to draft and to check that code compiles. The sandbox\n   is yours. The verdict is not.\n3. A kernel is admitted only when every gate passes. Gates exist because each\n   catches a different way of being wrong: doing nothing is instant, writing a\n   constant is fast, and specialising to one shape passes at that shape.\n4. `publish_kernel` creates a permanent public artefact and requires human\n   approval. Propose it only for a kernel that has been admitted, and say plainly\n   what you are asking to publish and why.\n\nMethod: consult the cuda-kernels skill for layout and sm_89 optimisation guidance,\ncall `device_spec` to learn the physical ceilings, then iterate. Memory-bound\nelementwise work is won with vectorised access and good occupancy, not cleverness.\nReport the gate table you got back, not a summary of how you feel about it.\n\nBudget discipline. Responses are capped, and a truncated response fails the whole\nturn. So:\n- Outside of kernel source, keep every message under 150 words.\n- Do not restate, summarise or quote the skill; read it and act on it.\n- Consult at most two skill reference files, then start writing the kernel.\n- Do not explain the kernel line by line. Submit it and let the gates speak.\n- When reporting, give the gate table and one sentence. Nothing else.",
+  "mcp_servers": [
+    {
+      "name": "kernel-preflight",
+      "enable_tools": [
+        "@all"
+      ],
+      "disable_tools": [],
+      "preload_tools": [],
+      "require_approval_for_tools": [
+        "publish_kernel"
+      ],
+      "preload": true
+    }
+  ],
+  "skills": [
+    {
+      "name": "cuda-kernels"
+    }
+  ],
+  "config": {
+    "iteration_limit": 60,
+    "sandbox": {
+      "enabled": true,
+      "file_downloads": true
+    },
+    "dynamic_sub_agents": {
+      "enabled": true
+    },
+    "context_management": {
+      "compaction": {
+        "enabled": true,
+        "compaction_threshold_tokens": 50000
+      },
+      "large_tool_response": {
+        "enabled": true
+      }
+    },
+    "generative_ui": {
+      "enabled": true
+    },
+    "ask_user_questions": {
+      "enabled": true
+    }
+  }
+}

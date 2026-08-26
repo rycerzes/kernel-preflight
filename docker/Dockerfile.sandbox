@@ -1,0 +1,23 @@
+# Sandbox image for the kernel-preflight agent.
+#
+# TrueForge's sandbox bootstrap needs a POSIX shell, python3 and git (it
+# materialises git-backed skills and runs a Python downloader inside the
+# sandbox). The stock CUDA devel image has the toolchain but no Python, so the
+# session dies at init with "python3: not found".
+FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 python3-venv python3-pip git ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# TrueForge's git_downloader.py declares `pydantic==2.12.5` as a PEP 723
+# inline dependency. The local provider satisfies that by building a venv per
+# sandbox; baking it into the image is the container equivalent and skips a
+# pip install on every sandbox start. Pin matches theirs deliberately.
+RUN pip3 install --no-cache-dir --break-system-packages pydantic==2.12.5
+
+# The bootstrap invokes `python`, not just `python3`.
+RUN ln -sf /usr/bin/python3 /usr/local/bin/python
+
+CMD ["sleep", "infinity"]

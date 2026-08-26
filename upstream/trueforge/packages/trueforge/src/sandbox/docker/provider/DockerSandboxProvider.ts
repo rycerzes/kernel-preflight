@@ -143,6 +143,13 @@ export class CodeModeUnsupportedError extends Error {
 
 export class DockerSandboxProvider implements SandboxProvider {
   readonly type = 'docker';
+  /**
+   * Code Mode needs a bidirectional transport between harness and sandbox. The
+   * local provider uses a unix socket on a shared filesystem, which a container
+   * does not have by construction. Declared false so the session degrades to
+   * ordinary tool calls instead of constructing a transport that throws.
+   */
+  readonly supportsCodeMode = false;
 
   private readonly image: string;
   private readonly dockerBinary: string;

@@ -8,8 +8,10 @@ providers:
     auto_archive_interval_in_minutes: 60
     auto_delete_interval_in_minutes: 7200
   - type: docker
-    # CUDA devel image: provides nvcc plus a POSIX shell. Swap for a slimmer
-    # image when the sandbox does not need to compile GPU code.
-    image: nvidia/cuda:13.0.0-devel-ubuntu24.04
-    exec_timeout_ms: 300000
+    # The stock CUDA devel image has nvcc but no Python, and the sandbox
+    # bootstrap needs python3 plus pydantic to materialise git-backed skills --
+    # without them initialisation fails with "python3: not found". Build this
+    # image from docker/Dockerfile.sandbox before selecting the preset.
+    image: kernel-preflight-sandbox:cuda13
+    exec_timeout_ms: 600000
     gpus: all
