@@ -41,12 +41,49 @@ from typing import Any, Callable
 import torch
 
 # ---------------------------------------------------------------------------
+# Precision
+# ---------------------------------------------------------------------------
+
+# Storage dtype per declared precision contract. TF32 is a *compute* mode over
+# fp32 data, not a storage format, so it stores fp32 and differs only in which
+# hardware ceiling binds. bf16 and fp16 change the tensors themselves, which also
+# halves the compulsory byte traffic.
+STORAGE_DTYPE = {
+    "fp32": torch.float32,
+    "tf32": torch.float32,
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+}
+
+# Mantissa bits, used to widen the correctness tolerance for a declared reduced
+# precision. bf16 keeps 7 against fp32's 23, so its results carry roughly 2^16
+# times more relative error and cannot be held to an fp32 bar.
+PRECISION_MANTISSA = {"fp32": 23, "tf32": 10, "bf16": 7, "fp16": 10}
+
+
+def storage_dtype(precision: str) -> torch.dtype:
+    if precision not in STORAGE_DTYPE:
+        raise SystemExit(f"unknown precision {precision!r}")
+    return STORAGE_DTYPE[precision]
+
+
+def precision_tolerance_scale(precision: str) -> float:
+    """How much looser the tolerance must be than the fp32 baseline."""
+    return float(2 ** (23 - PRECISION_MANTISSA.get(precision, 23)))
+
+
+# ---------------------------------------------------------------------------
 # Inputs
 # ---------------------------------------------------------------------------
 
 
 def make_input(
-    shape: tuple[int, ...], seed: int, device: torch.device, *, exponent_range: int = 6
+    shape: tuple[int, ...],
+    seed: int,
+    device: torch.device,
+    *,
+    exponent_range: int = 6,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Values spanning several orders of magnitude, both signs.
 
@@ -70,11 +107,17 @@ def make_input(
         torch.tensor(1.0, device=device),
     )
     if exponent_range <= 0:
-        return (sign * (0.25 + unit)).contiguous()
+        return (sign * (0.25 + unit)).contiguous().to(dtype)
+    # bf16 has 8 exponent bits but only 7 of mantissa; a wide exponent spread costs
+    # it nothing in range and everything in precision, so narrow the spread for the
+    # low-mantissa formats rather than manufacture a correctness failure.
+    span = exponent_range if dtype is torch.float32 else min(exponent_range, 2)
     exponent = torch.randint(
-        -exponent_range, exponent_range + 1, shape, generator=gen, device=device, dtype=torch.float32
+        -span, span + 1, shape, generator=gen, device=device, dtype=torch.float32
     )
-    return (sign * (0.25 + unit) * torch.pow(torch.tensor(2.0, device=device), exponent)).contiguous()
+    return (
+        sign * (0.25 + unit) * torch.pow(torch.tensor(2.0, device=device), exponent)
+    ).contiguous().to(dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -85,15 +128,33 @@ def make_input(
 FP32_EPS = 1.1920929e-07
 
 
-def accumulation_tolerance(depth: int, safety: float = 8.0) -> float:
-    """Relative tolerance for an fp32 result accumulated over `depth` terms.
+MANTISSA_BITS_BY_DTYPE = {torch.float32: 23, torch.bfloat16: 7, torch.float16: 10}
 
-    A single global tolerance is wrong because ops differ in conditioning. Summing
-    `depth` products in fp32 accumulates roughly sqrt(depth) * eps of relative
-    error under random signs, so a 4096-deep GEMM cannot be held to the same bar
-    as an elementwise SiLU. `safety` covers the conditioning the model does not.
+
+def quantisation_error(dt: torch.dtype) -> float:
+    """Relative error from merely storing a value in `dt`."""
+    return float(2 ** -(MANTISSA_BITS_BY_DTYPE.get(dt, 23) + 1))
+
+
+def accumulation_tolerance(depth: int, safety: float = 8.0, dt: torch.dtype = torch.float32) -> float:
+    """Relative tolerance for a result accumulated over `depth` terms in `dt`.
+
+    Two independent error sources, and they must not be multiplied together:
+
+    * **Accumulation.** Summing `depth` products under random signs drifts by about
+      sqrt(depth) * eps. Tensor cores accumulate in fp32 regardless of input dtype,
+      so this term uses fp32 epsilon even for a bf16 kernel.
+    * **Quantisation.** Merely storing an input in bf16 costs 2^-8 of relative
+      precision before any arithmetic happens.
+
+    An earlier version multiplied the accumulation term by the full mantissa ratio
+    (2^16 for bf16), which produced a *relative tolerance of 8* — 800%, a gate that
+    admits anything. Taking the larger of the two terms is the correct model,
+    because one dominates: for fp32 the accumulation drift does, for bf16 the input
+    quantisation does by three orders of magnitude.
     """
-    return safety * math.sqrt(max(1, depth)) * FP32_EPS
+    accumulation = math.sqrt(max(1, depth)) * FP32_EPS
+    return safety * max(accumulation, quantisation_error(dt))
 
 
 @dataclass(frozen=True)
@@ -111,7 +172,7 @@ class Problem:
     rel_tol: float
 
 
-def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
+def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     x = make_input((rows, cols), seed, dev)
     w = make_input((cols,), seed ^ 0x5EED, dev)
     eps = 1e-6
@@ -124,14 +185,14 @@ def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
         out=torch.empty_like(x),
         meta={"rows": rows, "cols": cols, "eps": eps},
         reference=ref,
-        bytes_moved=2.0 * n * 4,
+        bytes_moved=2.0 * n * dt.itemsize,
         flops=4.0 * n,
-        working_set_bytes=2.0 * n * 4,
-        rel_tol=accumulation_tolerance(cols),
+        working_set_bytes=2.0 * n * dt.itemsize,
+        rel_tol=accumulation_tolerance(cols, dt=dt),
     )
 
 
-def _softmax(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
+def _softmax(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     x = make_input((rows, cols), seed, dev)
     ref = torch.softmax(x.double(), dim=-1)
     n = rows * cols
@@ -141,14 +202,14 @@ def _softmax(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
         out=torch.empty_like(x),
         meta={"rows": rows, "cols": cols},
         reference=ref,
-        bytes_moved=2.0 * n * 4,
+        bytes_moved=2.0 * n * dt.itemsize,
         flops=5.0 * n,
-        working_set_bytes=2.0 * n * 4,
-        rel_tol=accumulation_tolerance(cols),
+        working_set_bytes=2.0 * n * dt.itemsize,
+        rel_tol=accumulation_tolerance(cols, dt=dt),
     )
 
 
-def _silu(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
+def _silu(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     x = make_input((rows, cols), seed, dev)
     xd = x.double()
     ref = xd * torch.sigmoid(xd)
@@ -159,32 +220,32 @@ def _silu(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
         out=torch.empty_like(x),
         meta={"rows": rows, "cols": cols},
         reference=ref,
-        bytes_moved=2.0 * n * 4,
+        bytes_moved=2.0 * n * dt.itemsize,
         flops=4.0 * n,
-        working_set_bytes=2.0 * n * 4,
-        rel_tol=accumulation_tolerance(1),
+        working_set_bytes=2.0 * n * dt.itemsize,
+        rel_tol=accumulation_tolerance(1, dt=dt),
     )
 
 
-def _transpose(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
+def _transpose(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     x = make_input((rows, cols), seed, dev)
     ref = x.double().t().contiguous()
     n = rows * cols
     return Problem(
         label=f"{rows}x{cols}",
         inputs={"x": x},
-        out=torch.empty((cols, rows), device=dev, dtype=torch.float32),
+        out=torch.empty((cols, rows), device=dev, dtype=dt),
         meta={"rows": rows, "cols": cols},
         reference=ref,
-        bytes_moved=2.0 * n * 4,
+        bytes_moved=2.0 * n * dt.itemsize,
         flops=0.0,
         # Pure data movement: bit-exact, so no accumulation allowance.
         rel_tol=0.0,
-        working_set_bytes=2.0 * n * 4,
+        working_set_bytes=2.0 * n * dt.itemsize,
     )
 
 
-def _matmul(m: int, k: int, seed: int, dev: torch.device) -> Problem:
+def _matmul(m: int, k: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     """Square-ish GEMM. The first op in the set that is compute-bound.
 
     Arithmetic intensity is ~n/6, so at these sizes it sits far above the RTX
@@ -201,17 +262,17 @@ def _matmul(m: int, k: int, seed: int, dev: torch.device) -> Problem:
     return Problem(
         label=f"{m}x{k}x{n}",
         inputs={"a": a, "b": b},
-        out=torch.empty((m, n), device=dev, dtype=torch.float32),
+        out=torch.empty((m, n), device=dev, dtype=dt),
         meta={"m": m, "k": k, "n": n},
         reference=ref,
-        bytes_moved=float((m * k + k * n + m * n) * 4),
+        bytes_moved=float((m * k + k * n + m * n) * dt.itemsize),
         flops=2.0 * m * k * n,
-        working_set_bytes=float((m * k + k * n + m * n) * 4),
-        rel_tol=accumulation_tolerance(k),
+        working_set_bytes=float((m * k + k * n + m * n) * dt.itemsize),
+        rel_tol=accumulation_tolerance(k, dt=dt),
     )
 
 
-def _attention(seq: int, head_dim: int, seed: int, dev: torch.device) -> Problem:
+def _attention(seq: int, head_dim: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     """Single-head-per-batch scaled dot product attention, non-causal.
 
     Compute-bound like matmul, and included because it is the operation the
@@ -223,9 +284,9 @@ def _attention(seq: int, head_dim: int, seed: int, dev: torch.device) -> Problem
     shape = (batch, heads, seq, head_dim)
     # Bounded magnitudes: see make_input. Wide-exponent Q/K would make the
     # softmax saturate differently in fp32 and fp64 and fail correct kernels.
-    q = make_input(shape, seed, dev, exponent_range=0)
-    k = make_input(shape, seed ^ 0xA11, dev, exponent_range=0)
-    v = make_input(shape, seed ^ 0xB22, dev, exponent_range=0)
+    q = make_input(shape, seed, dev, exponent_range=0, dtype=dt)
+    k = make_input(shape, seed ^ 0xA11, dev, exponent_range=0, dtype=dt)
+    v = make_input(shape, seed ^ 0xB22, dev, exponent_range=0, dtype=dt)
     ref = torch.nn.functional.scaled_dot_product_attention(q.double(), k.double(), v.double())
     elements = batch * heads * seq * head_dim
     # QK^T and PV are each 2*b*h*s*s*d; the softmax is negligible beside them.
@@ -233,14 +294,18 @@ def _attention(seq: int, head_dim: int, seed: int, dev: torch.device) -> Problem
     return Problem(
         label=f"b{batch}h{heads}s{seq}d{head_dim}",
         inputs={"q": q, "k": k, "v": v},
-        out=torch.empty(shape, device=dev, dtype=torch.float32),
+        out=torch.empty(shape, device=dev, dtype=dt),
         meta={"batch": batch, "heads": heads, "seq": seq, "head_dim": head_dim},
         reference=ref,
-        bytes_moved=float(4 * elements * 4),  # q, k, v read; o written
+        bytes_moved=float(4 * elements * dt.itemsize),  # q, k, v read; o written
         flops=flops,
-        working_set_bytes=float(4 * elements * 4),
-        # Two chained accumulations of depth seq: QK^T then PV.
-        rel_tol=accumulation_tolerance(seq, safety=32.0),
+        working_set_bytes=float(4 * elements * dt.itemsize),
+        # Two chained accumulations of depth seq: QK^T then PV. safety=8 rather
+        # than the 32 an earlier version used -- that was compensating for a
+        # tolerance model which double-counted precision, and with the model fixed
+        # the measured deviation sits at roughly a quarter of this bound instead of
+        # a sixteenth. A gate with 16x of headroom is barely a gate.
+        rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
     )
 
 
@@ -390,6 +455,11 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
         # Never the max: with few repeats that index lands on the last element and
         # one cold sample would masquerade as the 90th percentile.
         "p90_ms": ordered[min((len(ordered) * 9) // 10, max(0, len(ordered) - 2))],
+        "p25_ms": ordered[len(ordered) // 4],
+        "p75_ms": ordered[(len(ordered) * 3) // 4],
+        # Samples above twice the median. Reported, not acted on: a spike under
+        # load is worth seeing without failing a kernel over it.
+        "outliers": sum(1 for v in ordered if v > 2.0 * statistics.median(ordered)),
         "max_ms": ordered[-1],
         "max_abs_err": max_abs,
         "max_rel_err": max_rel,
@@ -495,6 +565,7 @@ def main() -> int:
 
     builder, shapes = OPS[args.op]
     dev = torch.device("cuda:0")
+    dt = storage_dtype(args.precision)
     launch = load_candidate(args.candidate)
 
     payload: dict[str, Any] = {"nonce": args.nonce, "op": args.op, "precision": args.precision}
@@ -504,7 +575,7 @@ def main() -> int:
 
     shapes_out = []
     for index, dims in enumerate(shapes):
-        problem = builder(dims[0], dims[1], args.seed + index, dev)
+        problem = builder(dims[0], dims[1], args.seed + index, dev, dt)
         record = measure_problem(problem, launch, payload["repeats"])
         # The schema names these rows/cols for compatibility with the CUDA
         # harness; they are labels, and ops with other layouts report their own.

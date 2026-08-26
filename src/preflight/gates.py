@@ -56,11 +56,16 @@ class GateResult:
 # the floor, so a harness reporting an absurdly loose tolerance cannot wave a
 # broken kernel through, and a bit-exact op can still report zero.
 MIN_REL_TOL = 1e-6
-# Ratio of the 90th percentile to the median. Deliberately not max/min: the first
-# timed call carries lazy module load and context setup, so a single cold outlier
-# would otherwise invalidate a perfectly stable run -- an honest baseline measured
-# min 0.010 ms, median 0.011 ms, max 1.178 ms, i.e. 119x on max/min and 1.05x here.
-MAX_TIMING_SPREAD = 2.0
+# Interquartile ratio, p75/p25. The gate asks one question -- is the median a
+# trustworthy summary of this kernel's runtime -- and that calls for a robust
+# dispersion measure rather than a tail quantile.
+#
+# max/min failed an honest baseline at 119x on a single cold first call. p90/median
+# fixed the systematic case but not the tail: inside an eighteen-case sweep on a hot
+# device, a kernel measuring 1.00-1.06 in isolation once spiked past 2.0 and was
+# rejected. p75/p25 is unmoved by a handful of spikes by construction, while still
+# failing a genuinely bimodal kernel, because that shows up inside the quartiles.
+MAX_TIMING_SPREAD = 1.5
 # See sol.roofline: a trivial float4 copy reaches ~91% of peak on this class of
 # part, so a kernel doing real arithmetic above 95% indicates the harness, not
 # the kernel.
@@ -126,15 +131,22 @@ def _shape_label(shape: dict[str, Any]) -> str:
 
 
 def _precision_scale(measurement: dict[str, Any]) -> float:
-    """How much looser the tolerance must be for the declared precision.
+    """Extra tolerance the gate applies on top of what the harness reported.
 
-    A TF32 multiply keeps 10 mantissa bits against fp32's 23, so its results carry
-    roughly 2^13 times more relative error. Holding a declared TF32 kernel to an
-    fp32 bar would reject it for a trade it announced.
+    For a storage precision the harness already folded into `rel_tol` -- bf16 and
+    fp16 change the tensors, and the harness sizes the tolerance from their
+    quantisation error -- this is 1.0, because scaling twice is how a bf16
+    tolerance became 800%.
+
+    TF32 is the exception: it is a compute mode over fp32 *storage*, so the harness
+    cannot see it in the dtype and the widening has to happen here.
     """
     precision = str(measurement.get("precision", "fp32"))
-    bits = MANTISSA_BITS.get(precision, 23)
-    return float(2 ** (23 - bits))
+    if precision != "tf32":
+        return 1.0
+    # TF32 keeps 10 mantissa bits of the operands while accumulating in fp32, so
+    # the error is set by operand quantisation rather than by depth.
+    return float(2 ** (23 - MANTISSA_BITS["tf32"]))
 
 
 def _tolerance(shape: dict[str, Any], scale: float = 1.0) -> float:
@@ -213,22 +225,24 @@ def check_variance(measurement: dict[str, Any]) -> GateResult:
     worst_ratio = 0.0
     worst_shape = ""
     for shape in measurement["shapes"]:
-        if shape["median_ms"] <= 0:
+        if shape["median_ms"] <= 0 or shape.get("p25_ms", 0) <= 0:
             return GateResult("variance", GateStatus.FAIL, f"{_shape_label(shape)} reported a non-positive time")
-        ratio = shape["p90_ms"] / shape["median_ms"]
+        ratio = shape["p75_ms"] / shape["p25_ms"]
         if ratio > worst_ratio:
             worst_ratio, worst_shape = ratio, _shape_label(shape)
     if worst_ratio > MAX_TIMING_SPREAD:
         return GateResult(
             "variance",
             GateStatus.FAIL,
-            f"p90 is {worst_ratio:.1f}x the median at {worst_shape}; the timing is too "
-            f"unstable for the median to support a claim",
+            f"interquartile spread is {worst_ratio:.2f}x at {worst_shape}; half the samples "
+            f"disagree by that much, so the median does not summarise this kernel",
         )
+    spikes = sum(int(s.get("outliers", 0)) for s in measurement["shapes"])
+    note = f"; {spikes} sample(s) above 2x median, not counted against it" if spikes else ""
     return GateResult(
         "variance",
         GateStatus.PASS,
-        f"worst p90/median {worst_ratio:.2f}x over {measurement['repeats']} repeats",
+        f"worst interquartile spread {worst_ratio:.2f}x over {measurement['repeats']} repeats{note}",
     )
 
 
@@ -501,7 +515,7 @@ class Preflight:
 # checked before any gate touches it.
 REQUIRED_TOP_LEVEL = ("shapes", "peak_bandwidth_bytes_per_s", "repeats")
 REQUIRED_PER_SHAPE = (
-    "rows", "cols", "min_ms", "median_ms", "p90_ms", "max_ms",
+    "rows", "cols", "min_ms", "median_ms", "p90_ms", "p25_ms", "p75_ms", "max_ms",
     "max_abs_err", "max_rel_err", "has_nonfinite", "wrote_output",
     "input_sensitive", "inner_iters", "timed_output_written", "timed_max_rel_err", "rel_tol", "violation", "timed_violation",
     "bytes_moved", "flops", "working_set_bytes",

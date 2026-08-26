@@ -1,33 +1,31 @@
 """RMSNorm in Helion.
 
 Helion is a Python-embedded DSL hosted by the PyTorch Foundation that compiles to
-Triton. It raises the abstraction level: the loop structure and tiling are
-declared rather than indexed by hand, and tile sizes are normally left to its
-autotuner.
+Triton. It raises the abstraction level: loop structure and tiling are declared
+rather than indexed by hand, and tile sizes are normally left to its autotuner.
 
-Included because a backend-agnostic harness should not care which DSL wrote the
-kernel. The gates adjudicate a measurement schema, so this is audited by exactly
-the same nine gates, against the same reference and the same ceilings, as a
-hand-written CUDA kernel.
+Written in place. `out` is a parameter rather than allocated inside and returned,
+because the harness contract is to write into `out` and a returned tensor forces
+the adapter into a `copy_`. That copy alone cost a factor of two: 27.6% of peak
+bandwidth with it, 44% without, on an otherwise identical kernel.
 
-**The config is pinned, and that costs performance.** Helion's autotuner did not
-converge on this kernel within a bounded budget on this host: with a 30s budget it
-overran to 186s and reported "no valid compile times found", and with a longer
-budget it searched a single config. Autotuning is Helion's central value, so a
-pinned config understates it — this measures Helion-with-a-guess, not Helion at
-its best. The pinned config reaches roughly 43% of peak bandwidth against ~89% for
-the hand-written Triton kernel, and closing that gap is exactly what the autotuner
-is for.
+**The config is pinned, and choosing it correctly mattered more than the kernel.**
+Helion's autotuner did not converge here -- a 30s budget overran to 186s and
+reported no valid compile times -- so the config is chosen by hand. Sweeping the
+space on 4096x4096 shows why that is a liability:
 
-**The adapter also costs traffic.** Helion kernels return a tensor, and the
-harness contract is to write into `out`, so `launch_candidate` ends in a
-`copy_`. That is an extra full read and write the Triton candidate never pays, so
-roughly half the measured traffic here is the adapter rather than the kernel. It
-is a fair measurement of this adapter and an unfair comparison against Triton, and
-the honest fix is a Helion form that writes in place.
+    block_sizes=[1]   num_warps=4    910 GB/s   90% of peak
+    block_sizes=[4]   num_warps=8    908 GB/s   90%
+    block_sizes=[16]  num_warps=8    840 GB/s   83%
+    block_sizes=[32]  num_warps=8    474 GB/s   47%
+    block_sizes=[64]  num_warps=4    195 GB/s   19%
 
-The harness reports what it is given. That the number is low is a fact about this
-kernel, this config and this adapter — not about Helion.
+A 4.7x spread on the same kernel, the same DSL and the same hardware. An earlier
+version of this file pinned block_sizes=[32] and measured 47%, which said nothing
+about Helion and everything about the guess. Pinning a config measures the config.
+
+With block_sizes=[1] Helion reaches 90% of peak, level with hand-written CUDA
+(90.1%), Triton (89.6%) and TileLang (90.5%) on the same operation.
 """
 
 import helion
@@ -36,12 +34,11 @@ import torch
 
 
 @helion.kernel(
-    config=helion.Config(block_sizes=[32], num_warps=8, num_stages=2),
+    config=helion.Config(block_sizes=[1], num_warps=4, num_stages=2),
     static_shapes=True,
 )
-def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+def rmsnorm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, eps: float) -> torch.Tensor:
     rows, cols = x.shape
-    out = torch.empty_like(x)
     for tile_r in hl.tile(rows):
         row = x[tile_r, :]
         inv = torch.rsqrt(torch.mean(row * row, dim=-1, keepdim=True) + eps)
@@ -50,4 +47,4 @@ def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def launch_candidate(inputs, out, meta):
-    out.copy_(rmsnorm(inputs["x"], inputs["w"], meta["eps"]))
+    rmsnorm(inputs["x"], inputs["w"], out, meta["eps"])

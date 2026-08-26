@@ -242,6 +242,9 @@ struct ShapeResult {
   double min_ms;
   double median_ms;
   double p90_ms;
+  double p25_ms;
+  double p75_ms;
+  int outliers;
   double max_ms;
   double max_abs_err;
   double max_rel_err;
@@ -383,6 +386,14 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
     // and one outlier would masquerade as the 90th percentile.
     size_t cap = sorted.size() >= 3 ? sorted.size() - 2 : 0;
     r.p90_ms = sorted[idx < cap ? idx : cap];
+    r.p25_ms = sorted[sorted.size() / 4];
+    r.p75_ms = sorted[(sorted.size() * 3) / 4];
+    // Samples more than twice the median. Reported rather than acted on: a spike
+    // under load is worth seeing without failing a kernel over it.
+    r.outliers = 0;
+    for (double v : sorted) {
+      if (v > 2.0 * r.median_ms) ++r.outliers;
+    }
   }
   r.max_ms = sorted.back();
   r.max_abs_err = dev.max_abs;
@@ -477,12 +488,12 @@ int main(int argc, char** argv) {
   std::fprintf(out, "  \"shapes\": [\n");
   for (int i = 0; i < shape_count; ++i) {
     ShapeResult r = measure(*op, shapes[i][0], shapes[i][1], repeats, seed + static_cast<unsigned int>(i));
-    std::fprintf(out, "    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"p90_ms\": %.6f, \"max_ms\": %.6f, "
+    std::fprintf(out, "    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"p90_ms\": %.6f, \"p25_ms\": %.6f, \"p75_ms\": %.6f, \"outliers\": %d, \"max_ms\": %.6f, "
                 "\"max_abs_err\": %.6g, \"max_rel_err\": %.6g, \"violation\": %.6g, \"has_nonfinite\": %s, "
                 "\"wrote_output\": %s, \"input_sensitive\": %s, "
                 "\"inner_iters\": %d, \"timed_output_written\": %s, \"timed_max_rel_err\": %.6g, \"timed_violation\": %.6g, "
                 "\"rel_tol\": %.6g, \"bytes_moved\": %.1f, \"flops\": %.1f, \"working_set_bytes\": %.1f}%s\n",
-                r.rows, r.cols, r.min_ms, r.median_ms, r.p90_ms, r.max_ms, r.max_abs_err, r.max_rel_err, r.violation,
+                r.rows, r.cols, r.min_ms, r.median_ms, r.p90_ms, r.p25_ms, r.p75_ms, r.outliers, r.max_ms, r.max_abs_err, r.max_rel_err, r.violation,
                 r.has_nonfinite ? "true" : "false", r.wrote_output ? "true" : "false",
                 r.input_sensitive ? "true" : "false",
                 r.inner_iters, r.timed_output_written ? "true" : "false", r.timed_max_rel_err, r.timed_violation,
