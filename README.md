@@ -112,7 +112,7 @@ including for this project's own numbers.
 | --- | --- |
 | `src/preflight/` | `harness/driver.cu` measures, `gates.py` adjudicates, `runner.py` isolates, `mcp_server.py` serves |
 | `src/preflight/device.py` | hardware ceilings read from the CUDA driver |
-| `src/preflight/harness/examples/` | a baseline and three adversarial kernels, kept as regression tests |
+| `src/preflight/harness/examples/` | 17 honest kernels across five toolchains and 5 adversarial ones, kept as regression tests |
 | `agent/` | the saved TrueForge agent manifest |
 | `docker/` | the sandbox image: CUDA plus the Python the bootstrap needs |
 | `upstream/trueforge/` | changes to TrueForge itself, mirroring upstream paths for a clean PR |

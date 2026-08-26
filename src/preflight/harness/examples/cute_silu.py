@@ -5,11 +5,10 @@ CUTLASS — layouts, tensors, copy atoms — with the same concepts as the C++ A
 It is the lowest-level of the Python DSLs here: there is no tile abstraction doing
 the indexing, the kernel addresses threads and blocks directly.
 
-Scope: elementwise only. A row reduction in CuTe wants explicit layout and
-partitioning work that the tile-level DSLs (Triton, TileLang, Helion) do for you,
-so rmsnorm is not attempted here. That asymmetry is the point of including CuTe at
-all — the same nine gates apply whether the kernel was written at tile level or at
-thread level.
+See cute_rmsnorm.py for a reduction in the same DSL, and for why both files
+cache the result of cute.compile: entering @cute.jit per launch measures the JIT
+rather than the kernel, and a compiled CuTe function silently accepts shapes it
+was not compiled for.
 
 CuTe DSL is in public beta at the time of writing, which is worth knowing when
 reading any number it produces.
@@ -38,7 +37,18 @@ def _launch(mX: cute.Tensor, mY: cute.Tensor):
     _silu_kernel(mX, mY).launch(grid=(blocks, 1, 1), block=(threads, 1, 1))
 
 
+# Keyed on shape: a compiled CuTe function does not check the shapes it is handed.
+_CACHE: dict[tuple[int, ...], object] = {}
+
+
 def launch_candidate(inputs, out, meta):
+    x = inputs["x"]
     # Flat views share storage with the 2D tensors, so writing through the view
     # writes the output the harness will check. Both are contiguous by construction.
-    _launch(from_dlpack(inputs["x"].view(-1)), from_dlpack(out.view(-1)))
+    args = (from_dlpack(x.view(-1)), from_dlpack(out.view(-1)))
+    key = tuple(x.shape)
+    compiled = _CACHE.get(key)
+    if compiled is None:
+        compiled = cute.compile(_launch, *args)
+        _CACHE[key] = compiled
+    compiled(*args)
