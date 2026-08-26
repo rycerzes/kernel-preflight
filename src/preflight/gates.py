@@ -130,41 +130,48 @@ def _shape_label(shape: dict[str, Any]) -> str:
     return f"{shape['rows']}x{shape['cols']}"
 
 
-def _precision_scale(measurement: dict[str, Any]) -> float:
-    """Extra tolerance the gate applies on top of what the harness reported.
+# TF32 rounds operands to 10 mantissa bits and accumulates in fp32, so its error
+# is operand quantisation: a flat bar, with the usual safety factor.
+TF32_TOLERANCE = 8.0 * 2.0 ** -(MANTISSA_BITS["tf32"] + 1)
 
-    For a storage precision the harness already folded into `rel_tol` -- bf16 and
-    fp16 change the tensors, and the harness sizes the tolerance from their
-    quantisation error -- this is 1.0, because scaling twice is how a bf16
-    tolerance became 800%.
 
-    TF32 is the exception: it is a compute mode over fp32 *storage*, so the harness
-    cannot see it in the dtype and the widening has to happen here.
+def _violation_scale(measurement: dict[str, Any], shape: dict[str, Any]) -> float:
+    """How much the declared precision widens this shape's bar.
+
+    `violation` is expressed in units of the harness's own `rel_tol`, which is
+    derived from fp32 and grows as sqrt(depth). For bf16 and fp16 this is 1.0: the
+    harness can see those in the dtype and has already folded them into `rel_tol`.
+    Scaling twice is how a bf16 tolerance once became 800%.
+
+    TF32 is the exception, and not only because it is invisible in the dtype -- it
+    is a compute mode over fp32 storage. It rounds its *operands* to 10 mantissa
+    bits and accumulates in fp32, so the error is set by operand quantisation and
+    does not grow with depth. The measured deviation of a Triton TF32 matmul is
+    flat at about 1.5e-3 from k=512 to k=4096, while the harness's fp32 `rel_tol`
+    grows 2.8x across that range.
+
+    A fixed multiplier therefore gets the shape of the curve wrong as well as its
+    height. Multiplying a sqrt(depth) base by 2^13 reached 0.5 at k=4096 -- about
+    128x looser than the contract, and loosening further the deeper the reduction,
+    which is backwards. The bar is `TF32_TOLERANCE` instead, converted here into
+    the units `violation` is already reported in.
+
+    Never below 1.0: for a reduction deep enough that the fp32 accumulation bar
+    exceeds the TF32 quantisation bar, the wider of the two is the honest one, and
+    tightening below what the harness itself demands of fp32 would fail correct
+    kernels.
     """
-    precision = str(measurement.get("precision", "fp32"))
-    if precision != "tf32":
+    if str(measurement.get("precision", "fp32")) != "tf32":
         return 1.0
-    # TF32 keeps 10 mantissa bits of the operands while accumulating in fp32, so
-    # the error is set by operand quantisation rather than by depth.
-    return float(2 ** (23 - MANTISSA_BITS["tf32"]))
-
-
-def _tolerance(shape: dict[str, Any], scale: float = 1.0) -> float:
-    """The bar this shape must meet: what the harness derived, floored.
-
-    Zero is meaningful and preserved -- transpose moves data without arithmetic
-    and is expected to be bit-exact.
-    """
     reported = float(shape.get("rel_tol", 0.0))
     if reported <= 0.0:
-        return 0.0
-    return max(reported, MIN_REL_TOL) * scale
+        return 1.0
+    return max(1.0, TF32_TOLERANCE / reported)
 
 
 def check_correctness(measurement: dict[str, Any]) -> GateResult:
     worst = 0.0
     worst_shape = ""
-    scale = _precision_scale(measurement)
     precision = str(measurement.get("precision", "fp32"))
     for shape in measurement["shapes"]:
         if shape["has_nonfinite"]:
@@ -178,8 +185,9 @@ def check_correctness(measurement: dict[str, Any]) -> GateResult:
         # it fails torch's own matmul, because cancellation makes some reference
         # values near zero and the ratio then explodes on a correct kernel.
         # `violation` is measured against the harness's fp32-derived tolerance;
-        # a declared reduced precision widens the bar proportionally.
-        violation = float(shape.get("violation", 0.0)) / scale
+        # a declared reduced precision widens the bar -- see _violation_scale for
+        # why tf32 widens to a flat bar rather than a proportional one.
+        violation = float(shape.get("violation", 0.0)) / _violation_scale(measurement, shape)
         if violation > 1.0:
             return GateResult(
                 "correctness",
@@ -251,7 +259,7 @@ def check_shape_consistency(measurement: dict[str, Any]) -> GateResult:
     bad = [
         _shape_label(s)
         for s in measurement["shapes"]
-        if float(s.get("violation", 0.0)) / _precision_scale(measurement) > 1.0
+        if float(s.get("violation", 0.0)) / _violation_scale(measurement, s) > 1.0
         or s["has_nonfinite"]
         or not s["wrote_output"]
     ]
@@ -458,7 +466,7 @@ def check_timed_work(measurement: dict[str, Any]) -> GateResult:
         err = shape.get("timed_violation")
         if err is None:
             return GateResult("timed_work", GateStatus.FAIL, f"{label} reported no post-timing error")
-        if err / _precision_scale(measurement) > 1.0:
+        if err / _violation_scale(measurement, shape) > 1.0:
             return GateResult(
                 "timed_work",
                 GateStatus.FAIL,
