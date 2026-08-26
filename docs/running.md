@@ -42,7 +42,7 @@ exposed off the host, though the execution itself is containerised (see
 ## 3. TrueForge
 
 ```bash
-./run-trueforge.sh          # standalone mode, SQLite, localhost:8790
+TRUEFORGE_DIR=/path/to/trueforge ./run-trueforge.sh   # localhost:8790, SQLite
 ```
 
 Two environment settings in that script are not optional on this host:

@@ -107,6 +107,23 @@ class Arm:
 
 
 def run_trial(arm: str, managed: bool) -> Trial:
+    """Never raises. An infrastructure failure is a failed trial, not a lost run."""
+    try:
+        return _run_trial(arm, managed)
+    except Exception as exc:  # noqa: BLE001 - any failure must still be recorded
+        return Trial(
+            arm=arm,
+            completed=False,
+            admitted=False,
+            total_tokens=0,
+            input_tokens=0,
+            output_tokens=0,
+            wall_s=0.0,
+            failure=f"{type(exc).__name__}: {exc}"[:200],
+        )
+
+
+def _run_trial(arm: str, managed: bool) -> Trial:
     session = call("POST", "/sessions", {"agent": {"spec": agent_spec(managed=managed)}})
     sid = session["data"]["id"]
     started = time.monotonic()
@@ -130,13 +147,24 @@ def run_trial(arm: str, managed: bool) -> Trial:
     metrics = state.get("metrics", {})
     completed = state.get("status") == "done"
 
+    # Read the gate tool's own verdict. Substring-matching event text would let
+    # assistant prose containing `"admitted": true` count as an admission, which
+    # is precisely the mistake this whole project exists to avoid — trusting a
+    # claim because the agent made it.
     admitted = False
     for event in events:
+        if event.get("type") != "tool.response":
+            continue
         content = event.get("content")
-        if isinstance(content, str) and '"admitted": true' in content.replace("'", '"'):
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("admitted") is True and "gates" in payload:
             admitted = True
-        elif isinstance(content, str) and '"admitted":true' in content:
-            admitted = True
+            break
 
     return Trial(
         arm=arm,
@@ -157,10 +185,14 @@ def main() -> None:
     args = parser.parse_args()
 
     arms = {"managed": Arm("managed"), "raw": Arm("raw")}
-    # Interleaved rather than blocked, so drift in GPU state or provider latency
-    # hits both arms rather than only the one that ran second.
+    # Alternate which arm goes first. Interleaving alone is not enough: if
+    # `managed` always ran first, arm would be confounded with within-pair order,
+    # and warmup, throttling or monotonic provider drift could favour one arm.
     for index in range(args.trials):
-        for name, managed in (("managed", True), ("raw", False)):
+        order = (("managed", True), ("raw", False))
+        if index % 2:
+            order = tuple(reversed(order))
+        for name, managed in order:
             print(f"[{index + 1}/{args.trials}] {name} ...", flush=True)
             trial = run_trial(name, managed)
             arms[name].trials.append(trial)
