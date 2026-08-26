@@ -121,18 +121,43 @@ void reference_transpose(const std::vector<float>& x, const std::vector<float>&,
   }
 }
 
+using FlopFn = double (*)(int rows, int cols);
+
+// Compulsory arithmetic per invocation. Only the order of magnitude matters: it
+// decides which ceiling binds, and a factor-of-two error in the FLOP count moves
+// an op across the ridge only if it was already sitting on it.
+double flops_per_element(int rows, int cols, double per_element) {
+  return static_cast<double>(rows) * cols * per_element;
+}
+double flops_rmsnorm(int rows, int cols) { return flops_per_element(rows, cols, 4.0); }
+double flops_softmax(int rows, int cols) { return flops_per_element(rows, cols, 5.0); }
+double flops_silu(int rows, int cols) { return flops_per_element(rows, cols, 4.0); }
+double flops_transpose(int, int) { return 0.0; }
+
 struct OpSpec {
   const char* name;
   ReferenceFn reference;
+  FlopFn flops;
   bool uses_weight;
 };
 
 constexpr OpSpec OPS[] = {
-    {"rmsnorm", &reference_rmsnorm, true},
-    {"softmax", &reference_softmax, false},
-    {"silu", &reference_silu, false},
-    {"transpose", &reference_transpose, false},
+    {"rmsnorm", &reference_rmsnorm, &flops_rmsnorm, true},
+    {"softmax", &reference_softmax, &flops_softmax, false},
+    {"silu", &reference_silu, &flops_silu, false},
+    {"transpose", &reference_transpose, &flops_transpose, false},
 };
+
+int fp32_lanes_per_sm(int major, int minor) {
+  switch (major * 10 + minor) {
+    case 70: case 72: case 75: return 64;   // Volta, Turing
+    case 80: return 64;                     // GA100 (A100)
+    case 86: case 87: case 89: return 128;  // GA10x, Orin, Ada
+    case 90: return 128;                    // Hopper
+    case 100: case 120: return 128;         // Blackwell
+    default: return 0;                      // unknown: refuse to guess
+  }
+}
 
 const OpSpec* find_op(const char* name) {
   for (const OpSpec& op : OPS) {
@@ -191,6 +216,7 @@ struct ShapeResult {
   bool timed_output_written;  // the measured calls wrote a result too
   double timed_max_rel_err;   // error of the last measured call
   double bytes_moved;
+  double flops;
   double working_set_bytes;
 };
 
@@ -303,6 +329,7 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
   r.timed_max_rel_err = timed_dev.max_rel;
   // Compulsory traffic: read x once, write y once. The weight vector is cached.
   r.bytes_moved = 2.0 * static_cast<double>(bytes);
+  r.flops = op.flops(rows, cols);
   // Input + output are both live across the kernel; the weight vector is negligible.
   r.working_set_bytes = 2.0 * static_cast<double>(bytes);
   return r;
@@ -332,8 +359,9 @@ int main(int argc, char** argv) {
   const int shapes[][2] = {{512, 2048}, {1024, 4096}, {4096, 4096}, {8192, 4096}, {16384, 4096}};
   const int shape_count = sizeof(shapes) / sizeof(shapes[0]);
 
-  int mem_clock_khz = 0, bus_width_bits = 0;
+  int mem_clock_khz = 0, bus_width_bits = 0, sm_clock_khz = 0;
   CUDA_CHECK(cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, 0));
+  CUDA_CHECK(cudaDeviceGetAttribute(&sm_clock_khz, cudaDevAttrClockRate, 0));
   CUDA_CHECK(cudaDeviceGetAttribute(&bus_width_bits, cudaDevAttrGlobalMemoryBusWidth, 0));
   cudaDeviceProp props{};
   CUDA_CHECK(cudaGetDeviceProperties(&props, 0));
@@ -350,6 +378,16 @@ int main(int argc, char** argv) {
   // set that fits in L2 never crosses the memory bus, so the DRAM roofline does
   // not bound it and a correct kernel can legitimately appear to exceed peak.
   std::printf("  \"l2_cache_bytes\": %d,\n", props.l2CacheSize);
+  // Zero when the lane count for this architecture is unknown. The auditor must
+  // treat that as "no compute ceiling available", not as "zero FLOPs".
+  {
+    int lanes = fp32_lanes_per_sm(props.major, props.minor);
+    double peak_flops = lanes == 0 ? 0.0
+                                   : static_cast<double>(props.multiProcessorCount) * lanes * 2.0 *
+                                         (static_cast<double>(sm_clock_khz) * 1e3);
+    std::printf("  \"peak_fp32_flops\": %.1f,\n", peak_flops);
+    std::printf("  \"sm_count\": %d,\n", props.multiProcessorCount);
+  }
   std::printf("  \"repeats\": %d,\n", repeats);
   std::printf("  \"seed\": %u,\n", seed);
   std::printf("  \"shapes\": [\n");
@@ -359,12 +397,12 @@ int main(int argc, char** argv) {
                 "\"max_abs_err\": %.6g, \"max_rel_err\": %.6g, \"has_nonfinite\": %s, "
                 "\"wrote_output\": %s, \"input_sensitive\": %s, "
                 "\"timed_output_written\": %s, \"timed_max_rel_err\": %.6g, "
-                "\"bytes_moved\": %.1f, \"working_set_bytes\": %.1f}%s\n",
+                "\"bytes_moved\": %.1f, \"flops\": %.1f, \"working_set_bytes\": %.1f}%s\n",
                 r.rows, r.cols, r.min_ms, r.median_ms, r.p90_ms, r.max_ms, r.max_abs_err, r.max_rel_err,
                 r.has_nonfinite ? "true" : "false", r.wrote_output ? "true" : "false",
                 r.input_sensitive ? "true" : "false",
                 r.timed_output_written ? "true" : "false", r.timed_max_rel_err,
-                r.bytes_moved, r.working_set_bytes,
+                r.bytes_moved, r.flops, r.working_set_bytes,
                 i + 1 == shape_count ? "" : ",");
   }
   std::printf("  ],\n");

@@ -33,6 +33,9 @@ class GateStatus(str, Enum):
     NOT_APPLICABLE = "n/a"
     """The gate cannot bound this measurement; see the reason, and do not read it as a pass."""
 
+    UNVERIFIABLE_COMPUTE = "unverif"
+    """Under the ceiling we could compute, but a ceiling we needed was unavailable."""
+
 
 @dataclass(frozen=True)
 class GateResult:
@@ -42,6 +45,8 @@ class GateResult:
 
     @property
     def blocking(self) -> bool:
+        # UNVERIFIABLE_COMPUTE does not block: the measurement is sound on the axis
+        # that could be checked. It is surfaced so a reader knows what was not.
         return self.status is GateStatus.FAIL
 
 
@@ -152,29 +157,62 @@ def check_shape_consistency(measurement: dict[str, Any]) -> GateResult:
 
 
 def check_roofline(measurement: dict[str, Any]) -> GateResult:
-    """Bound achieved DRAM bandwidth by the memory bus.
+    """Bound achieved throughput by whichever ceiling actually binds.
 
-    Only shapes whose working set clears L2 are auditable this way. A smaller
-    working set is served from cache, never crosses the memory bus, and can
+    Two ceilings, and picking the wrong one makes the gate useless in opposite
+    directions. Below the ridge point the memory bus binds; above it the SMs do.
+    Auditing a compute-bound kernel against DRAM bandwidth would pass anything,
+    and auditing a memory-bound one against FLOPs would too.
+
+    Only shapes whose working set clears L2 are auditable on the memory side. A
+    smaller working set is served from cache, never crosses the bus, and can
     legitimately exceed DRAM peak -- an RTX 4090 baseline measures ~1820 GB/s at
-    1024x4096 against a 1008 GB/s bus, and it is not cheating. Applying the DRAM
-    ceiling there would accuse a correct kernel.
+    1024x4096 against a 1008 GB/s bus, and it is not cheating.
+
+    Scope: the compute ceiling here is FP32. A kernel using tensor cores has a
+    substantially higher ceiling (roughly 2x on Ada for bf16) and would be
+    mis-audited, so tensor-core work is out of scope until that ceiling is
+    modelled rather than assumed.
     """
-    peak = measurement["peak_bandwidth_bytes_per_s"]
+    peak_bw = measurement["peak_bandwidth_bytes_per_s"]
+    peak_flops = measurement.get("peak_fp32_flops") or 0.0
     l2 = measurement.get("l2_cache_bytes", 0)
     threshold = l2 * L2_CLEARANCE
+    ridge = (peak_flops / peak_bw) if peak_bw > 0 and peak_flops > 0 else None
 
-    audited: list[tuple[str, float]] = []
+    worst: tuple[float, str, str, float, float] | None = None
     resident: list[str] = []
+    unbounded: list[str] = []
+
     for shape in measurement["shapes"]:
         label = _shape_label(shape)
-        if shape["working_set_bytes"] < threshold:
-            resident.append(label)
-            continue
-        achieved = shape["bytes_moved"] / (shape["median_ms"] / 1000.0)
-        audited.append((label, achieved / peak))
+        seconds = shape["median_ms"] / 1000.0
+        if seconds <= 0:
+            return GateResult("roofline", GateStatus.FAIL, f"{label} reported a non-positive time")
 
-    if not audited:
+        flops = shape.get("flops", 0.0) or 0.0
+        intensity = flops / shape["bytes_moved"] if shape["bytes_moved"] else 0.0
+        compute_bound = ridge is not None and intensity > ridge
+
+        if compute_bound:
+            fraction = (flops / seconds) / peak_flops
+            worst_candidate = (fraction, label, "compute", flops / seconds / 1e12, peak_flops / 1e12)
+        else:
+            if shape["working_set_bytes"] < threshold:
+                resident.append(label)
+                continue
+            if ridge is None and intensity > 0:
+                # No compute ceiling available and the op does arithmetic: a
+                # memory-side pass cannot rule out a compute-side impossibility.
+                unbounded.append(label)
+            achieved = shape["bytes_moved"] / seconds
+            fraction = achieved / peak_bw
+            worst_candidate = (fraction, label, "memory", achieved / 1e9, peak_bw / 1e9)
+
+        if worst is None or worst_candidate[0] > worst[0]:
+            worst = worst_candidate
+
+    if worst is None:
         return GateResult(
             "roofline",
             GateStatus.NOT_APPLICABLE,
@@ -182,27 +220,40 @@ def check_roofline(measurement: dict[str, Any]) -> GateResult:
             "DRAM bandwidth does not bound cache-resident traffic",
         )
 
-    label, fraction = max(audited, key=lambda item: item[1])
+    fraction, label, bound, achieved_scaled, ceiling_scaled = worst
+    units = "GB/s" if bound == "memory" else "TFLOP/s"
+    ceiling_name = "memory bus" if bound == "memory" else "FP32 pipelines"
+
     if fraction > 1.0:
         return GateResult(
             "roofline",
             GateStatus.FAIL,
-            f"{label} implies {fraction * 100:.0f}% of the {peak / 1e9:.0f} GB/s memory bus "
-            f"({fraction:.1f}x the hardware maximum) with a working set too large to cache — "
-            "physically impossible",
+            f"{label} implies {achieved_scaled:.1f} {units} against a {ceiling_scaled:.1f} {units} "
+            f"{ceiling_name} ceiling ({fraction:.1f}x the hardware maximum) — physically impossible",
         )
     if fraction > IMPLAUSIBLE_FRACTION:
         return GateResult(
             "roofline",
             GateStatus.FAIL,
-            f"{label} implies {fraction:.1%} of peak DRAM bandwidth; above "
-            f"{IMPLAUSIBLE_FRACTION:.0%} points at the measurement, not the kernel",
+            f"{label} implies {fraction:.1%} of the {ceiling_scaled:.1f} {units} {ceiling_name} "
+            f"ceiling; above {IMPLAUSIBLE_FRACTION:.0%} points at the measurement, not the kernel",
         )
-    note = f" ({len(resident)} cache-resident shape(s) not auditable)" if resident else ""
+    if unbounded:
+        return GateResult(
+            "roofline",
+            GateStatus.UNVERIFIABLE_COMPUTE,
+            f"{fraction:.1%} of the {ceiling_scaled:.1f} {units} {ceiling_name} ceiling at {label}, "
+            f"but no FP32 ceiling is known for this device, so a compute-bound "
+            f"impossibility cannot be ruled out",
+        )
+    notes = []
+    if resident:
+        notes.append(f"{len(resident)} cache-resident shape(s) not auditable")
+    suffix = f" ({', '.join(notes)})" if notes else ""
     return GateResult(
         "roofline",
         GateStatus.PASS,
-        f"peak DRAM utilisation {fraction:.1%} at {label}{note}",
+        f"peak {ceiling_name} utilisation {fraction:.1%} at {label}{suffix}",
     )
 
 
@@ -315,7 +366,12 @@ class Preflight:
     def summary(self) -> str:
         lines = [f"{'ADMITTED' if self.admitted else 'REJECTED'}  {self.measurement.get('device', 'unknown device')}"]
         for gate in self.gates:
-            mark = {GateStatus.PASS: "pass", GateStatus.FAIL: "FAIL", GateStatus.NOT_APPLICABLE: "n/a "}[gate.status]
+            mark = {
+                GateStatus.PASS: "pass",
+                GateStatus.FAIL: "FAIL",
+                GateStatus.NOT_APPLICABLE: "n/a ",
+                GateStatus.UNVERIFIABLE_COMPUTE: "?   ",
+            }[gate.status]
             lines.append(f"  [{mark}] {gate.name}: {gate.detail}")
         return "\n".join(lines)
 
@@ -335,7 +391,7 @@ REQUIRED_PER_SHAPE = (
     "rows", "cols", "min_ms", "median_ms", "p90_ms", "max_ms",
     "max_abs_err", "max_rel_err", "has_nonfinite", "wrote_output",
     "input_sensitive", "timed_output_written", "timed_max_rel_err",
-    "bytes_moved", "working_set_bytes",
+    "bytes_moved", "flops", "working_set_bytes",
 )
 
 

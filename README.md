@@ -111,6 +111,7 @@ including for this project's own numbers.
 | Path | Contents |
 | --- | --- |
 | `src/preflight/` | `harness/driver.cu` measures, `gates.py` adjudicates, `runner.py` isolates, `mcp_server.py` serves |
+| `src/preflight/device.py` | hardware ceilings read from the CUDA driver |
 | `src/preflight/harness/examples/` | a baseline and three adversarial kernels, kept as regression tests |
 | `agent/` | the saved TrueForge agent manifest |
 | `docker/` | the sandbox image: CUDA plus the Python the bootstrap needs |
