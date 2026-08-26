@@ -68,9 +68,24 @@ def wait_until_cool(max_c=55.0, timeout_s=240):
     """
     deadline = time.time() + timeout_s
     while True:
-        temp = float(subprocess.run(
-            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=15).stdout.strip().splitlines()[0])
+        # Every failure mode here -- nvidia-smi missing, a transient driver error,
+        # empty output, an unparseable line -- has to be survivable. This runs
+        # outside the per-case handler, so raising would abort the whole sweep and
+        # discard the cases already recorded, which is the opposite of the
+        # incremental-write guarantee the rest of this script makes.
+        temp = None
+        try:
+            probe = subprocess.run(
+                ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=15)
+            if probe.returncode == 0:
+                lines = [l.strip() for l in probe.stdout.splitlines() if l.strip()]
+                if lines:
+                    temp = float(lines[0])
+        except (OSError, subprocess.SubprocessError, ValueError):
+            temp = None
+        if temp is None:
+            return None  # cannot tell; let the caller note it and carry on
         if temp <= max_c:
             return temp
         if time.time() >= deadline:

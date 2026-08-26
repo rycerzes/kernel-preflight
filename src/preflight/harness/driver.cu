@@ -272,7 +272,8 @@ struct ShapeResult {
   bool wrote_output;      // output changed from the poison value
   bool input_sensitive;   // output changed when the input changed
   int inner_iters;            // launches batched into one timed sample
-  bool timed_output_written;  // the measured calls wrote a result too
+  bool timed_output_written;   // the measured calls wrote a result too
+  bool timed_has_nonfinite;   // ...and whether any of it was NaN or Inf
   double timed_max_rel_err;   // error of the last measured call
   double timed_violation;
   double rel_tol;
@@ -423,6 +424,10 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
   r.input_sensitive = input_sensitive;
   r.inner_iters = inner;
   r.timed_output_written = timed_output_written;
+  // compare() skips non-finite elements, so they never reach timed_violation.
+  // Reported, not dropped: a candidate that wrote one true value and NaN
+  // everywhere else during the timed calls satisfied both of the other checks.
+  r.timed_has_nonfinite = timed_dev.has_nonfinite;
   r.timed_max_rel_err = timed_dev.max_rel;
   r.timed_violation = timed_dev.violation;
   // Compulsory traffic: read x once, write y once. The weight vector is cached.
@@ -518,7 +523,7 @@ int main(int argc, char** argv) {
     std::fprintf(out, "    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"p90_ms\": %.6f, \"p25_ms\": %.6f, \"p75_ms\": %.6f, \"outliers\": %d, \"max_ms\": %.6f, "
                 "\"max_abs_err\": %.6g, \"max_rel_err\": %.6g, \"violation\": %.6g, \"has_nonfinite\": %s, "
                 "\"wrote_output\": %s, \"input_sensitive\": %s, "
-                "\"inner_iters\": %d, \"timed_output_written\": %s, \"timed_max_rel_err\": %.6g, \"timed_violation\": %.6g, "
+                "\"inner_iters\": %d, \"timed_output_written\": %s, \"timed_has_nonfinite\": %s, \"timed_max_rel_err\": %.6g, \"timed_violation\": %.6g, "
                 "\"rel_tol\": %.6g, \"bytes_moved\": %.1f, \"flops\": %.1f, \"working_set_bytes\": %.1f}%s\n",
                 r.rows, r.cols, json_double(r.min_ms), json_double(r.median_ms),
                 json_double(r.p90_ms), json_double(r.p25_ms), json_double(r.p75_ms),
@@ -527,6 +532,7 @@ int main(int argc, char** argv) {
                 r.has_nonfinite ? "true" : "false", r.wrote_output ? "true" : "false",
                 r.input_sensitive ? "true" : "false",
                 r.inner_iters, r.timed_output_written ? "true" : "false",
+                r.timed_has_nonfinite ? "true" : "false",
                 json_double(r.timed_max_rel_err), json_double(r.timed_violation),
                 json_double(r.rel_tol), json_double(r.bytes_moved), json_double(r.flops),
                 json_double(r.working_set_bytes),

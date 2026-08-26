@@ -540,6 +540,17 @@ def check_timed_work(measurement: dict[str, Any]) -> GateResult:
                 GateStatus.FAIL,
                 f"the measured calls at {label} wrote nothing; only the warmup did work",
             )
+        # Checked before the error, because the error is computed over the finite
+        # elements only -- a NaN has no distance from anything, so it is skipped.
+        # One true value in a NaN-filled output therefore satisfies both the
+        # written check and the error check, and did.
+        if shape.get("timed_has_nonfinite", False):
+            return GateResult(
+                "timed_work",
+                GateStatus.FAIL,
+                f"the measured calls at {label} produced NaN or Inf where the warmup did not; "
+                f"the reported error covers only the elements that are finite",
+            )
         err = shape.get("timed_violation")
         if err is None:
             return GateResult("timed_work", GateStatus.FAIL, f"{label} reported no post-timing error")
@@ -603,7 +614,8 @@ REQUIRED_TOP_LEVEL = ("shapes", "peak_bandwidth_bytes_per_s", "repeats")
 REQUIRED_PER_SHAPE = (
     "rows", "cols", "min_ms", "median_ms", "p90_ms", "p25_ms", "p75_ms", "max_ms",
     "max_abs_err", "max_rel_err", "has_nonfinite", "wrote_output",
-    "input_sensitive", "inner_iters", "timed_output_written", "timed_max_rel_err", "rel_tol", "violation", "timed_violation",
+    "input_sensitive", "inner_iters", "timed_output_written", "timed_has_nonfinite",
+    "timed_max_rel_err", "rel_tol", "violation", "timed_violation",
     "bytes_moved", "flops", "working_set_bytes",
 )
 

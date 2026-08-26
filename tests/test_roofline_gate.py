@@ -51,6 +51,7 @@ def measurement(*, flops: float, median_ms: float, bytes_moved: float = WORKING_
                 "wrote_output": True,
                 "input_sensitive": True,
                 "timed_output_written": True,
+                "timed_has_nonfinite": False,
                 "timed_max_rel_err": 0.0,
                 "inner_iters": 1,
                 "rel_tol": 1e-5,

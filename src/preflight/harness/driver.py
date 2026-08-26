@@ -435,8 +435,17 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
             clocks.append(clock)
 
     # Revalidate what the last *measured* call produced.
+    #
+    # `timed_written` asks only whether anything was written, and `timed_violation`
+    # is computed over the finite elements because a NaN has no distance from
+    # anything. Both are therefore satisfiable by a single element, and a candidate
+    # that wrote one true value and NaN everywhere else during the timed calls was
+    # admitted. So the non-finite flag from this comparison is reported rather than
+    # discarded, which is all it took -- it was already being computed.
     timed_written = bool(torch.isfinite(out).any().item())
-    _, timed_rel, timed_violation, _ = deviation(out, problem.reference, problem.rel_tol)
+    _, timed_rel, timed_violation, timed_nonfinite = deviation(
+        out, problem.reference, problem.rel_tol
+    )
 
     ordered = sorted(samples)
     return {
@@ -461,6 +470,7 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
         "inner_iters": inner,
         "sm_clock_hz_observed": (statistics.median(clocks) if clocks else None),
         "timed_output_written": timed_written,
+        "timed_has_nonfinite": timed_nonfinite,
         "timed_max_rel_err": timed_rel,
         "timed_violation": timed_violation,
         "rel_tol": problem.rel_tol,
