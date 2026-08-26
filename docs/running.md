@@ -54,6 +54,14 @@ launching a kernel, by reading the nonce and output path out of `sys.argv` and
 > existed. One of them diagnosed it correctly — *"this is clearly a systematic
 > issue with the test"* — which was right, and the test had already been fixed on
 > disk.
+>
+> Restarting it does disrupt live sessions: TrueForge logs a burst of
+> `Error on remote MCP transport kernel-preflight` and reconnects on the next
+> tool call, so restart between runs rather than during one.
+
+`PYTHONPATH=src` is not optional. Without it the module is not importable at all,
+and with a stale copy of `src/preflight/` at the repository root it would import
+*that* instead — see the shadow-package trap below.
 
 ## 3. TrueForge
 
@@ -115,6 +123,14 @@ into a prompt.
   above 16384 with a 400. A model that writes long responses will truncate and
   fail the turn; the agent instructions carry explicit brevity rules for that
   reason.
+- **The model provider can time out mid-turn.** A long kernel-writing turn has
+  failed with `server-execution-timeout` raised from the LLM client, which aborts
+  the whole agent thread rather than the one call. Nothing in this repository can
+  fix that; it is a property of routing to a hosted model over a long turn, and it
+  is worth knowing before reading a failed run as an agent mistake.
+- **Sandboxes outlive their sessions.** Combined with the missing `reapStale`
+  schedule above, containers from finished runs were still up ten hours later. The
+  labelled-reap command above is the manual remedy.
 
 ## A limitation the fan-out exposed
 
