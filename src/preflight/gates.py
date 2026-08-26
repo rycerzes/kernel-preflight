@@ -69,12 +69,75 @@ IMPLAUSIBLE_FRACTION = 0.95
 # enough for the DRAM roofline to bound it.
 L2_CLEARANCE = 2.0
 
+# Dense FLOPs per SM per clock, by compute capability and precision class.
+#
+# Derived from published *dense* peak TFLOPS divided by (SM count x boost clock),
+# which lands on exact powers of two and is the check that the derivation is
+# sound. Vendor headline numbers usually quote 2:4 structured sparsity and are
+# double these; using those would double every ceiling and make impossible claims
+# look merely ambitious.
+#
+# The entry that matters most is the pair on 8.0 versus 8.9. On an A100, TF32
+# tensor cores are 8x the FP32 pipelines (1024 against 128). On Ada consumer parts
+# they are identical (256 and 256). So auditing a TF32 kernel against the FP32
+# ceiling is coincidentally correct on a 4090 and wrong by 8x on an A100 — which
+# is the entire reason this table exists rather than a single FP32 number.
+#
+# Absent entries are deliberate. Hopper's figures do not divide cleanly with the
+# clocks available here, so rather than guess, a kernel on an unlisted device or
+# precision is reported unverifiable on the compute axis.
+DENSE_FLOPS_PER_SM_CLOCK: dict[tuple[int, int], dict[str, int]] = {
+    (7, 0): {"fp32": 128, "fp16": 1024},                              # V100
+    (7, 5): {"fp32": 128, "fp16": 1024},                              # T4, Turing
+    (8, 0): {"fp32": 128, "tf32": 1024, "fp16": 2048, "bf16": 2048},  # A100
+    (8, 6): {"fp32": 256, "tf32": 256, "fp16": 512, "bf16": 512},     # GA10x
+    (8, 9): {"fp32": 256, "tf32": 256, "fp16": 512, "bf16": 512},     # Ada
+}
+
+# Mantissa bits per precision class, used to scale the correctness tolerance. A
+# TF32 multiply keeps 10 bits against fp32's 23, so its results carry roughly
+# 2^13 times more relative error and cannot be held to an fp32 bar.
+MANTISSA_BITS = {"fp32": 23, "tf32": 10, "bf16": 7, "fp16": 10}
+
+
+def compute_ceiling(measurement: dict[str, Any]) -> tuple[float | None, str]:
+    """Dense FLOP ceiling for the declared precision, or None with a reason."""
+    precision = str(measurement.get("precision", "fp32"))
+    cap = str(measurement.get("compute_capability", ""))
+    sm_count = measurement.get("sm_count")
+    sm_clock_hz = measurement.get("sm_clock_hz")
+    if not sm_count or not sm_clock_hz:
+        return None, "the harness did not report SM count and clock"
+    try:
+        major, minor = (int(part) for part in cap.split("."))
+    except ValueError:
+        return None, f"unparseable compute capability {cap!r}"
+    table = DENSE_FLOPS_PER_SM_CLOCK.get((major, minor))
+    if table is None:
+        return None, f"no dense-FLOP figures recorded for compute capability {cap}"
+    per_clock = table.get(precision)
+    if per_clock is None:
+        return None, f"compute capability {cap} has no {precision} tensor path recorded"
+    return float(sm_count) * per_clock * float(sm_clock_hz), precision
+
 
 def _shape_label(shape: dict[str, Any]) -> str:
     return f"{shape['rows']}x{shape['cols']}"
 
 
-def _tolerance(shape: dict[str, Any]) -> float:
+def _precision_scale(measurement: dict[str, Any]) -> float:
+    """How much looser the tolerance must be for the declared precision.
+
+    A TF32 multiply keeps 10 mantissa bits against fp32's 23, so its results carry
+    roughly 2^13 times more relative error. Holding a declared TF32 kernel to an
+    fp32 bar would reject it for a trade it announced.
+    """
+    precision = str(measurement.get("precision", "fp32"))
+    bits = MANTISSA_BITS.get(precision, 23)
+    return float(2 ** (23 - bits))
+
+
+def _tolerance(shape: dict[str, Any], scale: float = 1.0) -> float:
     """The bar this shape must meet: what the harness derived, floored.
 
     Zero is meaningful and preserved -- transpose moves data without arithmetic
@@ -83,12 +146,14 @@ def _tolerance(shape: dict[str, Any]) -> float:
     reported = float(shape.get("rel_tol", 0.0))
     if reported <= 0.0:
         return 0.0
-    return max(reported, MIN_REL_TOL)
+    return max(reported, MIN_REL_TOL) * scale
 
 
 def check_correctness(measurement: dict[str, Any]) -> GateResult:
     worst = 0.0
     worst_shape = ""
+    scale = _precision_scale(measurement)
+    precision = str(measurement.get("precision", "fp32"))
     for shape in measurement["shapes"]:
         if shape["has_nonfinite"]:
             return GateResult(
@@ -100,20 +165,24 @@ def check_correctness(measurement: dict[str, Any]) -> GateResult:
         # sits exactly on the tolerance. Pure relative error is not usable here:
         # it fails torch's own matmul, because cancellation makes some reference
         # values near zero and the ratio then explodes on a correct kernel.
-        violation = float(shape.get("violation", 0.0))
+        # `violation` is measured against the harness's fp32-derived tolerance;
+        # a declared reduced precision widens the bar proportionally.
+        violation = float(shape.get("violation", 0.0)) / scale
         if violation > 1.0:
             return GateResult(
                 "correctness",
                 GateStatus.FAIL,
-                f"{_shape_label(shape)} exceeds tolerance by {violation:.1f}x "
-                f"(max abs error {shape['max_abs_err']:.3g}, tolerance {_tolerance(shape):.3g} relative)",
+                f"{_shape_label(shape)} exceeds the {precision} tolerance by {violation:.1f}x "
+                f"(max abs error {shape['max_abs_err']:.3g}). If the kernel deliberately "
+                f"computes in reduced precision it must declare it; an undeclared downgrade "
+                f"buys speed with accuracy the caller did not agree to",
             )
         if violation > worst:
             worst, worst_shape = violation, _shape_label(shape)
     return GateResult(
         "correctness",
         GateStatus.PASS,
-        f"worst deviation {worst:.2f}x of tolerance at {worst_shape or 'all shapes'}",
+        f"worst deviation {worst:.2f}x of the {precision} tolerance at {worst_shape or 'all shapes'}",
     )
 
 
@@ -168,7 +237,9 @@ def check_shape_consistency(measurement: dict[str, Any]) -> GateResult:
     bad = [
         _shape_label(s)
         for s in measurement["shapes"]
-        if float(s.get("violation", 0.0)) > 1.0 or s["has_nonfinite"] or not s["wrote_output"]
+        if float(s.get("violation", 0.0)) / _precision_scale(measurement) > 1.0
+        or s["has_nonfinite"]
+        or not s["wrote_output"]
     ]
     total = len(measurement["shapes"])
     if bad and len(bad) < total:
@@ -200,7 +271,9 @@ def check_roofline(measurement: dict[str, Any]) -> GateResult:
     modelled rather than assumed.
     """
     peak_bw = measurement["peak_bandwidth_bytes_per_s"]
-    peak_flops = measurement.get("peak_fp32_flops") or 0.0
+    ceiling_flops, ceiling_note = compute_ceiling(measurement)
+    peak_flops = ceiling_flops or 0.0
+    precision = str(measurement.get("precision", "fp32"))
     l2 = measurement.get("l2_cache_bytes", 0)
     threshold = l2 * L2_CLEARANCE
     ridge = (peak_flops / peak_bw) if peak_bw > 0 and peak_flops > 0 else None
@@ -247,7 +320,7 @@ def check_roofline(measurement: dict[str, Any]) -> GateResult:
 
     fraction, label, bound, achieved_scaled, ceiling_scaled = worst
     units = "GB/s" if bound == "memory" else "TFLOP/s"
-    ceiling_name = "memory bus" if bound == "memory" else "FP32 pipelines"
+    ceiling_name = "memory bus" if bound == "memory" else f"{precision} pipelines"
 
     if fraction > 1.0:
         return GateResult(
@@ -268,8 +341,7 @@ def check_roofline(measurement: dict[str, Any]) -> GateResult:
             "roofline",
             GateStatus.UNVERIFIABLE_COMPUTE,
             f"{fraction:.1%} of the {ceiling_scaled:.1f} {units} {ceiling_name} ceiling at {label}, "
-            f"but no FP32 ceiling is known for this device, so a compute-bound "
-            f"impossibility cannot be ruled out",
+            f"but {ceiling_note}, so a compute-bound impossibility cannot be ruled out",
         )
     notes = []
     if resident:
@@ -356,7 +428,7 @@ def check_timed_work(measurement: dict[str, Any]) -> GateResult:
         err = shape.get("timed_violation")
         if err is None:
             return GateResult("timed_work", GateStatus.FAIL, f"{label} reported no post-timing error")
-        if err > 1.0:
+        if err / _precision_scale(measurement) > 1.0:
             return GateResult(
                 "timed_work",
                 GateStatus.FAIL,

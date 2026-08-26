@@ -425,6 +425,9 @@ def device_ceilings(dev_index: int = 0) -> dict[str, Any]:
         "peak_fp32_flops": peak_flops,
         "l2_cache_bytes": props.L2_cache_size,
         "sm_count": props.multi_processor_count,
+        # Reported so the auditor can compute a ceiling for any precision class,
+        # not just the fp32 one this function happens to derive.
+        "sm_clock_hz": float(sm_clock_khz) * 1e3,
     }
 
 
@@ -448,6 +451,12 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument("--seed", type=int, default=20260826)
     parser.add_argument("--nonce", default="")
+    parser.add_argument(
+        "--precision",
+        default="fp32",
+        help="Numerical contract the candidate claims to honour: fp32, tf32, bf16 or fp16. "
+             "Sets both the correctness tolerance and which hardware ceiling binds.",
+    )
     args = parser.parse_args()
 
     started = time.perf_counter()
@@ -459,7 +468,7 @@ def main() -> int:
     dev = torch.device("cuda:0")
     launch = load_candidate(args.candidate)
 
-    payload: dict[str, Any] = {"nonce": args.nonce, "op": args.op}
+    payload: dict[str, Any] = {"nonce": args.nonce, "op": args.op, "precision": args.precision}
     payload.update(device_ceilings())
     payload["repeats"] = max(5, args.repeats)
     payload["seed"] = args.seed

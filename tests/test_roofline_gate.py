@@ -27,6 +27,11 @@ def measurement(*, flops: float, median_ms: float, bytes_moved: float = WORKING_
     return {
         "peak_bandwidth_bytes_per_s": PEAK_BW,
         "peak_fp32_flops": peak_flops,
+        # sm_89 with 128 SMs at 2.52 GHz: 128 * 256 * 2.52e9 = 82.6 TFLOP/s fp32.
+        "compute_capability": "8.9" if peak_flops else "99.0",
+        "sm_count": 128,
+        "sm_clock_hz": 2.52e9,
+        "precision": "fp32",
         "l2_cache_bytes": L2,
         "repeats": 30,
         "shapes": [

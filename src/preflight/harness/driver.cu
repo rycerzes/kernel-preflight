@@ -419,6 +419,9 @@ int main(int argc, char** argv) {
   // Echoed back so the caller can tell this output came from a run it started,
   // rather than from anything the candidate printed on its way past.
   const char* nonce = argc > 4 ? argv[4] : "";
+  // Numerical contract the candidate claims to honour. Sets the correctness
+  // tolerance and selects the hardware ceiling the roofline gate applies.
+  const char* precision = argc > 5 ? argv[5] : "fp32";
   if (repeats < 5) repeats = 5;
 
   // Several shapes, so specialising to one is visible as failure on the others.
@@ -438,7 +441,9 @@ int main(int argc, char** argv) {
   std::printf("{\n");
   std::printf("  \"nonce\": \"%s\",\n", nonce);
   std::printf("  \"op\": \"%s\",\n", op->name);
+  std::printf("  \"precision\": \"%s\",\n", precision);
   std::printf("  \"op\": \"%s\",\n", op->name);
+  std::printf("  \"precision\": \"%s\",\n", precision);
   std::printf("  \"device\": \"%s\",\n", props.name);
   std::printf("  \"compute_capability\": \"%d.%d\",\n", props.major, props.minor);
   std::printf("  \"peak_bandwidth_bytes_per_s\": %.1f,\n",
@@ -456,6 +461,8 @@ int main(int argc, char** argv) {
                                          (static_cast<double>(sm_clock_khz) * 1e3);
     std::printf("  \"peak_fp32_flops\": %.1f,\n", peak_flops);
     std::printf("  \"sm_count\": %d,\n", props.multiProcessorCount);
+    // So the auditor can build a ceiling for any precision class.
+    std::printf("  \"sm_clock_hz\": %.1f,\n", static_cast<double>(sm_clock_khz) * 1e3);
   }
   std::printf("  \"repeats\": %d,\n", repeats);
   std::printf("  \"seed\": %u,\n", seed);

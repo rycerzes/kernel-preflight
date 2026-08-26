@@ -66,10 +66,24 @@ def preflight_kernel(
         Field(description="Operation to measure: rmsnorm, softmax, silu or transpose."),
     ] = "rmsnorm",
     arch: Annotated[str, Field(description="Target architecture, e.g. sm_89.")] = "sm_89",
+    backend: Annotated[
+        str, Field(description="Toolchain: cuda, triton, helion or torch.")
+    ] = "cuda",
+    precision: Annotated[
+        str,
+        Field(
+            description="Numerical contract you claim to honour: fp32, tf32, bf16 or fp16. "
+            "Declaring reduced precision widens the correctness tolerance and selects the "
+            "matching hardware ceiling. An undeclared downgrade fails correctness."
+        ),
+    ] = "fp32",
     repeats: Annotated[int, Field(ge=5, le=200, description="Timed repeats per shape.")] = 30,
 ) -> dict[str, Any]:
     try:
-        report = preflight_source(candidate_source, op=op, arch=arch, repeats=repeats)
+        report = preflight_source(
+            candidate_source, op=op, backend=backend, precision=precision,
+            arch=arch, repeats=repeats,
+        )
     except CompileError as exc:
         # Timeouts are folded into these by the runner, so a slow compile or a
         # hanging candidate is a rejected verdict rather than a server error.

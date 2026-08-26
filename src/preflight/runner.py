@@ -49,6 +49,11 @@ CUDA_OPS = ("rmsnorm", "softmax", "silu", "transpose")
 PYTHON_OPS = ("rmsnorm", "softmax", "silu", "transpose", "matmul", "attention")
 PYTHON_BACKENDS = ("triton", "helion", "torch")
 SUPPORTED_BACKENDS = ("cuda", *PYTHON_BACKENDS)
+# The numerical contract a candidate claims. Declaring a reduced precision widens
+# the correctness tolerance and changes which hardware ceiling binds; an
+# undeclared downgrade is a correctness failure, because the speed was bought with
+# accuracy the caller did not agree to.
+SUPPORTED_PRECISIONS = ("fp32", "tf32", "bf16", "fp16")
 CUDA_IMAGE = "kernel-preflight-sandbox:cuda13"
 # Separate image: the Python backends need torch, Triton and Helion and never
 # invoke nvcc, so a CUDA-only preflight should not pay for a multi-gigabyte
@@ -155,6 +160,7 @@ def preflight_source(
     *,
     op: str = "rmsnorm",
     backend: str = "cuda",
+    precision: str = "fp32",
     arch: str = DEFAULT_ARCH,
     repeats: int = 30,
     seed: int = 20260826,
@@ -171,6 +177,10 @@ def preflight_source(
     allowed = CUDA_OPS if backend == "cuda" else PYTHON_OPS
     if op not in allowed:
         raise CompileError(f"backend {backend!r} does not support op {op!r}; supported: {', '.join(allowed)}")
+    if precision not in SUPPORTED_PRECISIONS:
+        raise CompileError(
+            f"unknown precision {precision!r}; supported: {', '.join(SUPPORTED_PRECISIONS)}"
+        )
     resolved_image = image or (CUDA_IMAGE if backend == "cuda" else PYTHON_IMAGE)
 
     with tempfile.TemporaryDirectory(prefix="kernel-preflight-") as tmp:
@@ -203,7 +213,7 @@ def preflight_source(
                 raise CompileError(compile_proc.stderr.strip() or "nvcc failed with no diagnostics")
             compile_log = compile_proc.stderr.strip()
             nonce = secrets.token_hex(16)
-            run_argv = ["./preflight", op, str(repeats), str(seed), nonce]
+            run_argv = ["./preflight", op, str(repeats), str(seed), nonce, precision]
         else:
             # Python backends JIT at run time, so there is no separate compile
             # step; a syntax error surfaces as a harness failure instead.
@@ -217,6 +227,7 @@ def preflight_source(
                 "--repeats", str(repeats),
                 "--seed", str(seed),
                 "--nonce", nonce,
+                "--precision", precision,
             ]
 
         started = time.monotonic()
