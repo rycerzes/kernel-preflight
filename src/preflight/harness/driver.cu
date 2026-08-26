@@ -20,6 +20,10 @@
 #include <limits>
 #include <vector>
 #include <chrono>
+// fdopen is POSIX, not in <cstdio>: the harness reports on a descriptor the
+// supervisor opened rather than a path it could be told.
+#include <stdio.h>
+#include <unistd.h>
 #include <cuda_runtime.h>
 
 extern "C" void launch_candidate(const float* x, const float* w, float* y, int rows, int cols, float eps,
@@ -427,18 +431,29 @@ int main(int argc, char** argv) {
   }
   int repeats = argc > 2 ? std::atoi(argv[2]) : 30;
   unsigned int seed = argc > 3 ? static_cast<unsigned int>(std::strtoul(argv[3], nullptr, 10)) : 20260826u;
-  // Echoed back so the caller can tell this output came from a run it started,
-  // rather than from anything the candidate printed on its way past.
-  const char* nonce = argc > 4 ? argv[4] : "";
   // Numerical contract the candidate claims to honour. Sets the correctness
   // tolerance and selects the hardware ceiling the roofline gate applies.
-  const char* precision = argc > 5 ? argv[5] : "fp32";
-  // Written to a file rather than stdout: stdout is shared with anything else the
-  // process links, and is the channel a candidate could forge a measurement on.
-  const char* out_path = argc > 6 ? argv[6] : "measurement.json";
-  std::FILE* out = std::fopen(out_path, "w");
+  const char* precision = argc > 4 ? argv[4] : "fp32";
+  // A descriptor, not a path, and no nonce anywhere in argv.
+  //
+  // The candidate is linked into this binary and its static constructors run
+  // before main, so anything reachable from here is reachable by it -- including
+  // argv, which a constructor can recover from /proc/self/cmdline even though it
+  // is not passed it. cheat_forge_proc.cu did exactly that: read the nonce and
+  // the output path, wrote a measurement claiming 92% of the memory bus, and
+  // _exit(0)'d before this function ran. It was admitted.
+  //
+  // So this process is no longer told either. supervisor.py holds them, opens the
+  // pipe this descriptor refers to, and is the only writer of the verdict. See
+  // supervisor.py for what the split does and does not guarantee.
+  int result_fd = argc > 5 ? std::atoi(argv[5]) : -1;
+  if (result_fd < 0) {
+    std::fprintf(stderr, "no result descriptor given\n");
+    return 4;
+  }
+  std::FILE* out = fdopen(result_fd, "w");
   if (out == nullptr) {
-    std::fprintf(stderr, "cannot open %s for writing\n", out_path);
+    std::fprintf(stderr, "cannot write to descriptor %d\n", result_fd);
     return 4;
   }
   if (repeats < 5) repeats = 5;
@@ -458,9 +473,6 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaGetDeviceProperties(&props, 0));
 
   std::fprintf(out, "{\n");
-  std::fprintf(out, "  \"nonce\": \"%s\",\n", nonce);
-  std::fprintf(out, "  \"op\": \"%s\",\n", op->name);
-  std::fprintf(out, "  \"precision\": \"%s\",\n", precision);
   std::fprintf(out, "  \"op\": \"%s\",\n", op->name);
   std::fprintf(out, "  \"precision\": \"%s\",\n", precision);
   std::fprintf(out, "  \"device\": \"%s\",\n", props.name);
@@ -501,10 +513,10 @@ int main(int argc, char** argv) {
                 i + 1 == shape_count ? "" : ",");
   }
   std::fprintf(out, "  ],\n");
-  // Self-reported wall time. The caller compares this against the elapsed
-  // time it measured for the whole process; a forged result printed before
-  // any work happened cannot account for time it never spent.
-  std::fprintf(out, "  \"harness_wall_ms\": %.3f\n}\n",
+  // Informational only. The wall time the provenance gate uses is the one the
+  // supervisor observed from outside this process, because a self-reported
+  // duration is exactly what a forged measurement gets to choose.
+  std::fprintf(out, "  \"worker_wall_ms\": %.3f\n}\n",
               std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now() - harness_start).count());
   std::fclose(out);

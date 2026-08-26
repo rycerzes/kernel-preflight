@@ -37,6 +37,9 @@ from preflight.gates import Preflight, run_gates
 HARNESS_DIR = Path(__file__).parent / "harness"
 CUDA_DRIVER = HARNESS_DIR / "driver.cu"
 PYTHON_DRIVER = HARNESS_DIR / "driver.py"
+# Shared by both backends: the one process in the container that never runs
+# candidate code, and therefore the only one trusted to write a verdict.
+SUPERVISOR = HARNESS_DIR / "supervisor.py"
 DEFAULT_ARCH = "sm_89"
 # Operations the harness can measure. Each supplies its own double-precision host
 # reference; the candidate signature is shared, and ops without a weight vector or
@@ -122,6 +125,7 @@ def _run_in_container(
     argv: list[str],
     timeout_s: int,
     gpus: str | None,
+    stdin_data: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     docker_args = [
         _docker(),
@@ -170,10 +174,19 @@ def _run_in_container(
         "--env",
         "HELION_AUTOTUNE_COMPILE_TIMEOUT=180",
     ]
+    if stdin_data is not None:
+        # -i so the harness supervisor can be handed the run's secrets on stdin.
+        # They cannot travel in argv or the environment: a candidate runs inside
+        # this container and /proc/<ppid>/cmdline and /proc/<ppid>/environ are both
+        # readable from there, so anything placed in either is readable by the code
+        # being measured.
+        docker_args.append("-i")
     if gpus:
         docker_args += ["--gpus", gpus]
     docker_args += [image, *argv]
-    return subprocess.run(docker_args, capture_output=True, text=True, timeout=timeout_s)
+    return subprocess.run(
+        docker_args, capture_output=True, text=True, timeout=timeout_s, input=stdin_data,
+    )
 
 
 def preflight_source(
@@ -209,6 +222,11 @@ def preflight_source(
         # World-readable so the container user can read regardless of uid mapping.
         workdir.chmod(0o777)
 
+        # Both harnesses run under the same supervisor: it is the only process in
+        # the container that does not execute candidate code, and the only writer
+        # of the measurement.
+        (workdir / "supervisor.py").write_text(SUPERVISOR.read_text())
+
         compile_log = ""
         if backend == "cuda":
             (workdir / "candidate.cu").write_text(candidate_source)
@@ -234,7 +252,15 @@ def preflight_source(
                 raise CompileError(compile_proc.stderr.strip() or "nvcc failed with no diagnostics")
             compile_log = compile_proc.stderr.strip()
             nonce = secrets.token_hex(16)
-            run_argv = ["./preflight", op, str(repeats), str(seed), nonce, precision, MEASUREMENT_FILE]
+            # The harness binary links the candidate, so it is told neither the
+            # nonce nor the output path: a C++ static constructor runs before main
+            # and can read both out of /proc/self/cmdline. The supervisor holds
+            # them and owns the write.
+            run_argv = [
+                "python3", "supervisor.py", "--",
+                "./preflight", op, str(repeats), str(seed), precision, "{fd}",
+            ]
+            control = json.dumps({"nonce": nonce, "out": MEASUREMENT_FILE})
         else:
             # Python backends JIT at run time, so there is no separate compile
             # step; a syntax error surfaces as a harness failure instead.
@@ -242,15 +268,19 @@ def preflight_source(
             (workdir / "driver.py").write_text(PYTHON_DRIVER.read_text())
             nonce = secrets.token_hex(16)
             run_argv = [
+                "python3", "supervisor.py", "--",
                 "python3", "driver.py",
                 "--op", op,
                 "--candidate", "candidate.py",
                 "--repeats", str(repeats),
                 "--seed", str(seed),
-                "--nonce", nonce,
                 "--precision", precision,
-                "--out", MEASUREMENT_FILE,
+                "--result-fd", "{fd}",
             ]
+            # Deliberately not flags. driver.py runs a supervisor that spawns the
+            # process which imports the candidate, and passes it neither of these,
+            # so candidate code cannot echo the nonce or write the verdict itself.
+            control = json.dumps({"nonce": nonce, "out": MEASUREMENT_FILE})
 
         started = time.monotonic()
         try:
@@ -260,6 +290,7 @@ def preflight_source(
                 argv=run_argv,
                 timeout_s=RUN_TIMEOUT_S if backend == "cuda" else PYTHON_RUN_TIMEOUT_S,
                 gpus=gpus,
+                stdin_data=control,
             )
         except subprocess.TimeoutExpired as exc:
             limit = RUN_TIMEOUT_S if backend == "cuda" else PYTHON_RUN_TIMEOUT_S

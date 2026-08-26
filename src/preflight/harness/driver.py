@@ -32,6 +32,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import statistics
 import sys
 import time
@@ -535,32 +536,20 @@ def load_candidate(path: str) -> Callable:
     return launch
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--op", required=True, choices=sorted(OPS))
-    parser.add_argument("--candidate", required=True)
-    parser.add_argument("--repeats", type=int, default=30)
-    parser.add_argument("--seed", type=int, default=20260826)
-    parser.add_argument("--nonce", default="")
-    parser.add_argument(
-        "--out",
-        required=True,
-        help="Path to write the measurement JSON. Not stdout: stdout is a shared "
-             "channel that any imported library can log into, and TileLang does. It is "
-             "also the channel a candidate could print a forged measurement on.",
-    )
-    parser.add_argument(
-        "--precision",
-        default="fp32",
-        help="Numerical contract the candidate claims to honour: fp32, tf32, bf16 or fp16. "
-             "Sets both the correctness tolerance and which hardware ceiling binds.",
-    )
-    args = parser.parse_args()
+def run_worker(args: argparse.Namespace, result_fd: int) -> int:
+    """Measure the candidate and report on a file descriptor. Untrusted.
 
+    This is the only process that imports candidate code, and it is deliberately
+    ignorant: it is never told the nonce or the path the verdict is written to, so
+    it cannot forge provenance and cannot write a verdict at all. It reports its
+    numbers to `result_fd`, which supervisor.py opened -- see that file for why the
+    split exists and what it does and does not buy.
+    """
     started = time.perf_counter()
+    payload: dict[str, Any] = {"op": args.op, "precision": args.precision}
+
     if not torch.cuda.is_available():
-        with open(args.out, "w") as handle:
-            json.dump({"error": "CUDA unavailable"}, handle)
+        os.write(result_fd, json.dumps({"error": "CUDA unavailable"}).encode())
         return 3
 
     builder, shapes = OPS[args.op]
@@ -568,7 +557,6 @@ def main() -> int:
     dt = storage_dtype(args.precision)
     launch = load_candidate(args.candidate)
 
-    payload: dict[str, Any] = {"nonce": args.nonce, "op": args.op, "precision": args.precision}
     payload.update(device_ceilings())
     payload["repeats"] = max(5, args.repeats)
     payload["seed"] = args.seed
@@ -585,10 +573,38 @@ def main() -> int:
         torch.cuda.empty_cache()
 
     payload["shapes"] = shapes_out
-    payload["harness_wall_ms"] = (time.perf_counter() - started) * 1000.0
-    with open(args.out, "w") as handle:
-        json.dump(payload, handle)
+    payload["worker_wall_ms"] = (time.perf_counter() - started) * 1000.0
+    os.write(result_fd, json.dumps(payload).encode())
+    os.close(result_fd)
     return 0
+
+
+def main() -> int:
+    """The worker half of the harness. supervisor.py is the entry point.
+
+    Deliberately takes no output path and no nonce: this process imports candidate
+    code, so anything it is told, the candidate can read.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--op", required=True, choices=sorted(OPS))
+    parser.add_argument("--candidate", required=True)
+    parser.add_argument("--repeats", type=int, default=30)
+    parser.add_argument("--seed", type=int, default=20260826)
+    parser.add_argument(
+        "--result-fd",
+        type=int,
+        required=True,
+        help="Descriptor to report the measurement on. Not a path: the process that "
+             "runs candidate code is never told where the verdict goes.",
+    )
+    parser.add_argument(
+        "--precision",
+        default="fp32",
+        help="Numerical contract the candidate claims to honour: fp32, tf32, bf16 or fp16. "
+             "Sets both the correctness tolerance and which hardware ceiling binds.",
+    )
+    args = parser.parse_args()
+    return run_worker(args, args.result_fd)
 
 
 if __name__ == "__main__":
