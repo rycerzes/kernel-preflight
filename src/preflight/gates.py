@@ -390,7 +390,7 @@ REQUIRED_TOP_LEVEL = ("shapes", "peak_bandwidth_bytes_per_s", "repeats")
 REQUIRED_PER_SHAPE = (
     "rows", "cols", "min_ms", "median_ms", "p90_ms", "max_ms",
     "max_abs_err", "max_rel_err", "has_nonfinite", "wrote_output",
-    "input_sensitive", "timed_output_written", "timed_max_rel_err",
+    "input_sensitive", "inner_iters", "timed_output_written", "timed_max_rel_err",
     "bytes_moved", "flops", "working_set_bytes",
 )
 

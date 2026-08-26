@@ -213,6 +213,7 @@ struct ShapeResult {
   bool has_nonfinite;
   bool wrote_output;      // output changed from the poison value
   bool input_sensitive;   // output changed when the input changed
+  int inner_iters;            // launches batched into one timed sample
   bool timed_output_written;  // the measured calls wrote a result too
   double timed_max_rel_err;   // error of the last measured call
   double bytes_moved;
@@ -283,12 +284,32 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
   // stream 0 would not bracket -- the work would land after the stop event and be
   // omitted from the elapsed time entirely.
   CUDA_CHECK(cudaMemset(d_y, poison_byte, bytes));
-  for (int i = 0; i < repeats; ++i) {
-    auto t0 = std::chrono::steady_clock::now();
+
+  // Batch launches per sample so each sample spans enough work to measure. The
+  // smallest shape here runs in single-digit microseconds, where one scheduler
+  // hiccup dominates the sample and any percentile becomes noise rather than a
+  // measurement. A pilot launch sets the batch size; the reported time is per
+  // launch.
+  double pilot_ms;
+  {
+    auto p0 = std::chrono::steady_clock::now();
     launch_candidate(d_x, d_w, d_y, rows, cols, eps, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
+    pilot_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
+  }
+  const double target_sample_ms = 2.0;
+  int inner = 1;
+  if (pilot_ms > 0.0 && pilot_ms < target_sample_ms) {
+    double wanted = target_sample_ms / pilot_ms;
+    inner = wanted > 1000.0 ? 1000 : static_cast<int>(wanted) + 1;
+  }
+
+  for (int i = 0; i < repeats; ++i) {
+    auto t0 = std::chrono::steady_clock::now();
+    for (int j = 0; j < inner; ++j) launch_candidate(d_x, d_w, d_y, rows, cols, eps, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
     auto t1 = std::chrono::steady_clock::now();
-    samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count() / inner);
   }
   CUDA_CHECK(cudaGetLastError());
 
@@ -318,13 +339,20 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
   r.cols = cols;
   r.min_ms = sorted.front();
   r.median_ms = sorted[sorted.size() / 2];
-  r.p90_ms = sorted[(sorted.size() * 9) / 10];
+  {
+    size_t idx = (sorted.size() * 9) / 10;
+    // Never the max: with few repeats that index lands on the last element
+    // and one outlier would masquerade as the 90th percentile.
+    size_t cap = sorted.size() >= 3 ? sorted.size() - 2 : 0;
+    r.p90_ms = sorted[idx < cap ? idx : cap];
+  }
   r.max_ms = sorted.back();
   r.max_abs_err = dev.max_abs;
   r.max_rel_err = dev.max_rel;
   r.has_nonfinite = dev.has_nonfinite;
   r.wrote_output = wrote_output;
   r.input_sensitive = input_sensitive;
+  r.inner_iters = inner;
   r.timed_output_written = timed_output_written;
   r.timed_max_rel_err = timed_dev.max_rel;
   // Compulsory traffic: read x once, write y once. The weight vector is cached.
@@ -396,12 +424,12 @@ int main(int argc, char** argv) {
     std::printf("    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"p90_ms\": %.6f, \"max_ms\": %.6f, "
                 "\"max_abs_err\": %.6g, \"max_rel_err\": %.6g, \"has_nonfinite\": %s, "
                 "\"wrote_output\": %s, \"input_sensitive\": %s, "
-                "\"timed_output_written\": %s, \"timed_max_rel_err\": %.6g, "
+                "\"inner_iters\": %d, \"timed_output_written\": %s, \"timed_max_rel_err\": %.6g, "
                 "\"bytes_moved\": %.1f, \"flops\": %.1f, \"working_set_bytes\": %.1f}%s\n",
                 r.rows, r.cols, r.min_ms, r.median_ms, r.p90_ms, r.max_ms, r.max_abs_err, r.max_rel_err,
                 r.has_nonfinite ? "true" : "false", r.wrote_output ? "true" : "false",
                 r.input_sensitive ? "true" : "false",
-                r.timed_output_written ? "true" : "false", r.timed_max_rel_err,
+                r.inner_iters, r.timed_output_written ? "true" : "false", r.timed_max_rel_err,
                 r.bytes_moved, r.flops, r.working_set_bytes,
                 i + 1 == shape_count ? "" : ",");
   }

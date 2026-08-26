@@ -1,0 +1,28 @@
+# Sandbox image for the Triton and Helion backends.
+#
+# Separate from Dockerfile.sandbox on purpose. The CUDA backend needs nvcc and
+# nothing else; the Python backends need torch, Triton and Helion and never
+# invoke nvcc. Keeping them apart means a CUDA-only preflight does not pay for a
+# multi-gigabyte torch install, and a Triton preflight does not depend on a
+# toolchain it never uses.
+FROM kernel-preflight-sandbox:cuda13
+
+# cu130 to match the driver on the host. Versions are pinned: an unpinned torch
+# would silently change the reference implementation that every verdict is
+# measured against.
+RUN pip3 install --no-cache-dir --break-system-packages \
+      --index-url https://download.pytorch.org/whl/cu130 \
+      torch==2.12.0
+
+# Helion 1.4.0, released 2026-07-29 — past the 7-day release-age floor. It
+# compiles to Triton, which ships inside the torch wheel.
+RUN pip3 install --no-cache-dir --break-system-packages helion==1.4.0
+
+# Fail the build rather than a preflight run if the stack is not importable.
+RUN python3 -c "\
+import torch, triton, helion, importlib.metadata as m; \
+print('torch', torch.__version__, 'triton', m.version('triton'), 'helion', m.version('helion')); \
+assert hasattr(torch.nn.functional, 'scaled_dot_product_attention')"
+
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

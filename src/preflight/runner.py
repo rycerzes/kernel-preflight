@@ -34,13 +34,25 @@ from typing import Any
 from preflight.gates import Preflight, run_gates
 
 HARNESS_DIR = Path(__file__).parent / "harness"
-DRIVER = HARNESS_DIR / "driver.cu"
+CUDA_DRIVER = HARNESS_DIR / "driver.cu"
+PYTHON_DRIVER = HARNESS_DIR / "driver.py"
 DEFAULT_ARCH = "sm_89"
 # Operations the harness can measure. Each supplies its own double-precision host
 # reference; the candidate signature is shared, and ops without a weight vector or
 # epsilon simply ignore those arguments.
-SUPPORTED_OPS = ("rmsnorm", "softmax", "silu", "transpose")
-DEFAULT_IMAGE = "kernel-preflight-sandbox:cuda13"
+# Which harness runs an op, and therefore which image and candidate language.
+# `cuda` compiles a .cu against driver.cu; the Python backends import a .py
+# against driver.py. Both emit the same measurement schema, so the gates do not
+# know or care which produced a verdict.
+CUDA_OPS = ("rmsnorm", "softmax", "silu", "transpose")
+PYTHON_OPS = ("rmsnorm", "softmax", "silu", "transpose", "matmul", "attention")
+PYTHON_BACKENDS = ("triton", "helion", "torch")
+SUPPORTED_BACKENDS = ("cuda", *PYTHON_BACKENDS)
+CUDA_IMAGE = "kernel-preflight-sandbox:cuda13"
+# Separate image: the Python backends need torch, Triton and Helion and never
+# invoke nvcc, so a CUDA-only preflight should not pay for a multi-gigabyte
+# torch install.
+PYTHON_IMAGE = "kernel-preflight-sandbox:torch"
 COMPILE_TIMEOUT_S = 300
 RUN_TIMEOUT_S = 900
 # Container guardrails. Generous enough for nvcc, tight enough that a runaway
@@ -123,10 +135,11 @@ def preflight_source(
     candidate_source: str,
     *,
     op: str = "rmsnorm",
+    backend: str = "cuda",
     arch: str = DEFAULT_ARCH,
     repeats: int = 30,
     seed: int = 20260826,
-    image: str = DEFAULT_IMAGE,
+    image: str | None = None,
     gpus: str | None = "all",
 ) -> PreflightReport:
     """Run the full preflight on one candidate kernel source, in isolation.
@@ -134,43 +147,65 @@ def preflight_source(
     `candidate_source` must define
     `extern "C" void launch_candidate(const float*, const float*, float*, int, int, float, cudaStream_t)`.
     """
-    if op not in SUPPORTED_OPS:
-        raise CompileError(f"unknown op {op!r}; supported: {', '.join(SUPPORTED_OPS)}")
+    if backend not in SUPPORTED_BACKENDS:
+        raise CompileError(f"unknown backend {backend!r}; supported: {', '.join(SUPPORTED_BACKENDS)}")
+    allowed = CUDA_OPS if backend == "cuda" else PYTHON_OPS
+    if op not in allowed:
+        raise CompileError(f"backend {backend!r} does not support op {op!r}; supported: {', '.join(allowed)}")
+    resolved_image = image or (CUDA_IMAGE if backend == "cuda" else PYTHON_IMAGE)
 
     with tempfile.TemporaryDirectory(prefix="kernel-preflight-") as tmp:
         workdir = Path(tmp)
         # World-readable so the container user can read regardless of uid mapping.
         workdir.chmod(0o777)
-        (workdir / "candidate.cu").write_text(candidate_source)
-        (workdir / "driver.cu").write_text(DRIVER.read_text())
 
-        try:
-            compile_proc = _run_in_container(
-                workdir=workdir,
-                image=image,
-                # -Werror=format: a printf format/argument mismatch in the harness silently
-                # corrupts the measurement JSON rather than failing, which has bitten
-                # this file twice. Make it a build error.
-                argv=[
-                    "nvcc", "-O3", f"-arch={arch}",
-                    "-Xcompiler", "-Wformat", "-Xcompiler", "-Werror=format",
-                    "driver.cu", "candidate.cu", "-o", "preflight",
-                ],
-                timeout_s=COMPILE_TIMEOUT_S,
-                gpus=None,  # compilation needs no device
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise CompileError(f"compilation exceeded {COMPILE_TIMEOUT_S}s") from exc
-        if compile_proc.returncode != 0:
-            raise CompileError(compile_proc.stderr.strip() or "nvcc failed with no diagnostics")
+        compile_log = ""
+        if backend == "cuda":
+            (workdir / "candidate.cu").write_text(candidate_source)
+            (workdir / "driver.cu").write_text(CUDA_DRIVER.read_text())
+            try:
+                compile_proc = _run_in_container(
+                    workdir=workdir,
+                    image=resolved_image,
+                    # -Werror=format: a printf format/argument mismatch in the harness
+                    # silently corrupts the measurement JSON rather than failing, which
+                    # has bitten this file twice. Make it a build error.
+                    argv=[
+                        "nvcc", "-O3", f"-arch={arch}",
+                        "-Xcompiler", "-Wformat", "-Xcompiler", "-Werror=format",
+                        "driver.cu", "candidate.cu", "-o", "preflight",
+                    ],
+                    timeout_s=COMPILE_TIMEOUT_S,
+                    gpus=None,  # compilation needs no device
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise CompileError(f"compilation exceeded {COMPILE_TIMEOUT_S}s") from exc
+            if compile_proc.returncode != 0:
+                raise CompileError(compile_proc.stderr.strip() or "nvcc failed with no diagnostics")
+            compile_log = compile_proc.stderr.strip()
+            nonce = secrets.token_hex(16)
+            run_argv = ["./preflight", op, str(repeats), str(seed), nonce]
+        else:
+            # Python backends JIT at run time, so there is no separate compile
+            # step; a syntax error surfaces as a harness failure instead.
+            (workdir / "candidate.py").write_text(candidate_source)
+            (workdir / "driver.py").write_text(PYTHON_DRIVER.read_text())
+            nonce = secrets.token_hex(16)
+            run_argv = [
+                "python3", "driver.py",
+                "--op", op,
+                "--candidate", "candidate.py",
+                "--repeats", str(repeats),
+                "--seed", str(seed),
+                "--nonce", nonce,
+            ]
 
-        nonce = secrets.token_hex(16)
         started = time.monotonic()
         try:
             run_proc = _run_in_container(
                 workdir=workdir,
-                image=image,
-                argv=["./preflight", op, str(repeats), str(seed), nonce],
+                image=resolved_image,
+                argv=run_argv,
                 timeout_s=RUN_TIMEOUT_S,
                 gpus=gpus,
             )
@@ -180,7 +215,7 @@ def preflight_source(
 
         if run_proc.returncode != 0:
             raise HarnessError(
-                f"harness exited {run_proc.returncode}: {(run_proc.stderr or run_proc.stdout).strip()[:500]}"
+                f"harness exited {run_proc.returncode}: {(run_proc.stderr or run_proc.stdout).strip()[:800]}"
             )
         try:
             measurement = json.loads(run_proc.stdout)
@@ -189,6 +224,7 @@ def preflight_source(
         if "error" in measurement:
             raise HarnessError(str(measurement["error"]))
 
+        measurement["backend"] = backend
         # Provenance facts, recorded for the gate rather than enforced here, so a
         # rejection reads as a verdict with a reason instead of an exception.
         measurement["_provenance"] = {
@@ -197,8 +233,12 @@ def preflight_source(
             "repeats": repeats,
         }
 
-        return PreflightReport(preflight=run_gates(measurement), compile_log=compile_proc.stderr.strip())
+        return PreflightReport(preflight=run_gates(measurement), compile_log=compile_log)
 
 
 def preflight_file(path: str | Path, **kwargs: Any) -> PreflightReport:
-    return preflight_source(Path(path).read_text(), **kwargs)
+    """Preflight a candidate from disk. Backend defaults from the file suffix."""
+    source = Path(path).read_text()
+    if "backend" not in kwargs:
+        kwargs["backend"] = "cuda" if Path(path).suffix == ".cu" else "torch"
+    return preflight_source(source, **kwargs)
