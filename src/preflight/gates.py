@@ -346,6 +346,22 @@ def check_roofline(measurement: dict[str, Any]) -> GateResult:
     notes = []
     if resident:
         notes.append(f"{len(resident)} cache-resident shape(s) not auditable")
+    # A throttled device never had access to the peak the ceiling assumes, so a
+    # low utilisation may be the clock rather than the kernel. This cannot cause a
+    # false rejection -- only high fractions fail -- but it can send a reader, or
+    # an agent, chasing an optimisation that does not exist.
+    observed = [
+        s["sm_clock_hz_observed"]
+        for s in measurement["shapes"]
+        if s.get("sm_clock_hz_observed")
+    ]
+    max_clock = measurement.get("sm_clock_hz")
+    if observed and max_clock:
+        ratio = (sum(observed) / len(observed)) / float(max_clock)
+        if ratio < 0.9:
+            notes.append(
+                f"device ran at {ratio:.0%} of peak clock, so this understates the kernel"
+            )
     suffix = f" ({', '.join(notes)})" if notes else ""
     return GateResult(
         "roofline",

@@ -306,6 +306,22 @@ def deviation(got: torch.Tensor, want: torch.Tensor, rel_tol: float) -> tuple[fl
     return max_abs, max_rel, violation, has_nonfinite
 
 
+def current_sm_clock_hz() -> float | None:
+    """Actual SM clock right now, or None if it cannot be read.
+
+    Matters because the roofline ceiling is derived from the *maximum* clock. A
+    GPU that is thermally or power throttled never had access to that peak, so a
+    perfectly good kernel measures low and a reader concludes the kernel is bad.
+    Observed here: a sweep run immediately after 900 seconds of sustained
+    autotuning measured roughly a third of the throughput the same kernel reached
+    on an idle device.
+    """
+    try:
+        return float(torch.cuda.clock_rate()) * 1e6  # torch reports MHz
+    except Exception:
+        return None
+
+
 def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[str, Any]:
     out = problem.out
 
@@ -351,12 +367,16 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
         inner = min(1000, int(target_sample_ms / pilot_ms) + 1)
 
     samples: list[float] = []
+    clocks: list[float] = []
     for _ in range(repeats):
         t0 = time.perf_counter()
         for _ in range(inner):
             launch(problem.inputs, out, problem.meta)
         torch.cuda.synchronize()
         samples.append((time.perf_counter() - t0) * 1000.0 / inner)
+        clock = current_sm_clock_hz()
+        if clock:
+            clocks.append(clock)
 
     # Revalidate what the last *measured* call produced.
     timed_written = bool(torch.isfinite(out).any().item())
@@ -378,6 +398,7 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
         "wrote_output": wrote_output,
         "input_sensitive": input_sensitive,
         "inner_iters": inner,
+        "sm_clock_hz_observed": (statistics.median(clocks) if clocks else None),
         "timed_output_written": timed_written,
         "timed_max_rel_err": timed_rel,
         "timed_violation": timed_violation,

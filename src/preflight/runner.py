@@ -61,6 +61,13 @@ CUDA_IMAGE = "kernel-preflight-sandbox:cuda13"
 PYTHON_IMAGE = "kernel-preflight-sandbox:torch"
 COMPILE_TIMEOUT_S = 300
 RUN_TIMEOUT_S = 900
+# Python backends JIT and, for Helion, autotune per shape, so a full sweep takes
+# much longer than a CUDA compile-and-run.
+PYTHON_RUN_TIMEOUT_S = 2400
+# Helion autotunes each shape separately and will otherwise search until it is
+# satisfied. Bounded so a sweep terminates; the search happens during warmup, so
+# it never enters a timed sample.
+HELION_AUTOTUNE_BUDGET_S = 30
 # Container guardrails. Generous enough for nvcc, tight enough that a runaway
 # candidate cannot take the host with it.
 CONTAINER_MEMORY = "8g"
@@ -148,6 +155,15 @@ def _run_in_container(
         "TORCHINDUCTOR_CACHE_DIR=/work/.inductor",
         "--env",
         "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        f"HELION_AUTOTUNE_BUDGET_SECONDS={HELION_AUTOTUNE_BUDGET_S}",
+        # The search tries configs that do not compile, or compile slowly. Without
+        # this a single unlucky candidate config aborts the whole preflight, which
+        # is a property of the tuner rather than of the kernel under test.
+        "--env",
+        "HELION_AUTOTUNE_IGNORE_ERRORS=1",
+        "--env",
+        "HELION_AUTOTUNE_COMPILE_TIMEOUT=180",
     ]
     if gpus:
         docker_args += ["--gpus", gpus]
@@ -236,11 +252,12 @@ def preflight_source(
                 workdir=workdir,
                 image=resolved_image,
                 argv=run_argv,
-                timeout_s=RUN_TIMEOUT_S,
+                timeout_s=RUN_TIMEOUT_S if backend == "cuda" else PYTHON_RUN_TIMEOUT_S,
                 gpus=gpus,
             )
         except subprocess.TimeoutExpired as exc:
-            raise HarnessError(f"measurement exceeded {RUN_TIMEOUT_S}s") from exc
+            limit = RUN_TIMEOUT_S if backend == "cuda" else PYTHON_RUN_TIMEOUT_S
+            raise HarnessError(f"measurement exceeded {limit}s") from exc
         observed_wall_s = time.monotonic() - started
 
         if run_proc.returncode != 0:

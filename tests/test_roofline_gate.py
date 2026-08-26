@@ -49,6 +49,7 @@ def measurement(*, flops: float, median_ms: float, bytes_moved: float = WORKING_
                 "input_sensitive": True,
                 "timed_output_written": True,
                 "timed_max_rel_err": 0.0,
+                "inner_iters": 1,
                 "rel_tol": 1e-5,
                 "violation": 0.0,
                 "timed_violation": 0.0,
@@ -74,7 +75,7 @@ def test_high_intensity_is_audited_against_compute() -> None:
     seconds = flops / (PEAK_FLOPS * 0.5)
     result = check_roofline(measurement(flops=flops, median_ms=seconds * 1000))
     assert result.status is GateStatus.PASS
-    assert "FP32 pipelines" in result.detail, result.detail
+    assert "fp32 pipelines" in result.detail, result.detail
 
 
 def test_impossible_compute_claim_is_rejected() -> None:
@@ -84,7 +85,7 @@ def test_impossible_compute_claim_is_rejected() -> None:
     seconds = flops / (PEAK_FLOPS * 3.0)  # 3x the FP32 ceiling
     result = check_roofline(measurement(flops=flops, median_ms=seconds * 1000))
     assert result.status is GateStatus.FAIL
-    assert "FP32 pipelines" in result.detail
+    assert "fp32 pipelines" in result.detail
     assert "physically impossible" in result.detail
 
 
