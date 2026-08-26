@@ -51,19 +51,31 @@ def device_spec() -> dict[str, Any]:
     annotations={"readOnlyHint": True},
     description=(
         "Compile a candidate kernel against the fixed harness, measure it across "
-        "five shapes, and run every preflight gate. The candidate must define "
-        'extern \"C\" void launch_candidate(const float* x, const float* w, float* y, '
-        "int rows, int cols, float eps, cudaStream_t stream). Returns per-gate verdicts "
-        "and the raw measurement. Supported ops: rmsnorm (row reduction, uses w and eps), "
-        "softmax (row reduction, numerically delicate), silu (pure elementwise), "
-        "transpose (pure memory movement, y is cols x rows)."
+        "five shapes, and run every preflight gate. Returns per-gate verdicts and the "
+        "raw measurement. You submit source only and never a number: the harness owns "
+        "allocation, input distribution, timing, the reference and the tolerances.\n\n"
+        "With backend=cuda the candidate must define\n"
+        '  extern \"C\" void launch_candidate(const float* x, const float* w, float* y,\n'
+        "                                   int rows, int cols, float eps, cudaStream_t stream)\n"
+        "and may implement rmsnorm, softmax, silu or transpose.\n\n"
+        "With any Python backend (triton, helion, torch, cute, tilelang) it must define\n"
+        "  launch_candidate(inputs: dict[str, Tensor], out: Tensor, meta: dict) -> None\n"
+        "writing its result into `out` in place, and may additionally implement matmul "
+        "and attention.\n\n"
+        "Ops: rmsnorm (row reduction, uses w and eps), softmax (row reduction, "
+        "numerically delicate), silu (pure elementwise), transpose (pure memory "
+        "movement, y is cols x rows), matmul and attention (compute-bound, audited "
+        "against the arithmetic ceiling rather than the memory bus)."
     ),
 )
 def preflight_kernel(
     candidate_source: Annotated[str, Field(description="Full CUDA source defining launch_candidate.")],
     op: Annotated[
         str,
-        Field(description="Operation to measure: rmsnorm, softmax, silu or transpose."),
+        Field(
+            description="Operation to measure: rmsnorm, softmax, silu or transpose on any "
+            "backend; matmul and attention on the Python backends only."
+        ),
     ] = "rmsnorm",
     arch: Annotated[str, Field(description="Target architecture, e.g. sm_89.")] = "sm_89",
     backend: Annotated[
@@ -103,19 +115,47 @@ def preflight_kernel(
     description=(
         "Publish an admitted kernel to the Hugging Face Hub. This creates a permanent "
         "public artefact under your namespace and cannot be undone. Only call this after "
-        "preflight_kernel has admitted the kernel."
+        "preflight_kernel has admitted the kernel. Pass the same op, backend and precision "
+        "you were admitted under: the kernel is re-verified before publication, so a "
+        "mismatched declaration is rejected rather than published."
     ),
 )
 def publish_kernel(
     repo_id: Annotated[str, Field(description="Target repo, e.g. rycerzes/rmsnorm-sm89.")],
     candidate_source: Annotated[str, Field(description="The kernel source to publish.")],
     verdict_summary: Annotated[str, Field(description="The preflight summary to publish alongside it.")],
+    op: Annotated[
+        str,
+        Field(description="The operation this kernel implements. Must match the op it was admitted for."),
+    ] = "rmsnorm",
+    backend: Annotated[
+        str,
+        Field(description="The toolchain this kernel is written in. Must match the backend it was admitted for."),
+    ] = "cuda",
+    precision: Annotated[
+        str,
+        Field(description="The precision contract it was admitted under: fp32, tf32, bf16 or fp16."),
+    ] = "fp32",
+    arch: Annotated[str, Field(description="Target architecture, e.g. sm_89.")] = "sm_89",
 ) -> dict[str, Any]:
     # Re-verify rather than trust the caller's word that it passed. The whole
     # premise is that the agent's claims are not evidence, and "I already checked"
     # is a claim.
+    #
+    # The op, backend and precision must be re-declared here and are forwarded to
+    # the re-verification. Defaulting them, as this did until it was reviewed,
+    # re-verified every candidate as an fp32 CUDA RMSNorm: a softmax kernel was
+    # checked against the wrong reference, and no Triton, Helion, CuTe or TileLang
+    # kernel could be published at all because its Python source went to nvcc.
+    #
+    # Forwarding a caller-supplied precision is safe because the gates enforce the
+    # contract rather than take the claim on trust -- declaring bf16 widens the
+    # correctness tolerance but also lowers the roofline ceiling to the bf16 one,
+    # so a kernel cannot buy tolerance without also having to justify its speed.
     try:
-        report = preflight_source(candidate_source)
+        report = preflight_source(
+            candidate_source, op=op, backend=backend, precision=precision, arch=arch,
+        )
     except (CompileError, HarnessError, IsolationError) as exc:
         return {"published": False, "reason": f"re-verification failed: {exc}"[:2000]}
     if not report.admitted:
@@ -138,10 +178,13 @@ def publish_kernel(
     api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
     workdir = Path("/tmp") / f"kernel-preflight-publish-{secrets.token_hex(4)}"
     workdir.mkdir(parents=True, exist_ok=True)
-    (workdir / "rmsnorm.cu").write_text(candidate_source)
+    suffix = "cu" if backend == "cuda" else "py"
+    (workdir / f"{op}.{suffix}").write_text(candidate_source)
     (workdir / "PREFLIGHT.md").write_text(
         "# Preflight report\n\n"
         "Measured by a harness the kernel author did not control.\n\n"
+        f"- operation: `{op}`\n- toolchain: `{backend}`\n"
+        f"- precision contract: `{precision}`\n- architecture: `{arch}`\n\n"
         f"```\n{report.preflight.summary()}\n```\n\n"
         f"## Agent-supplied summary\n\n{verdict_summary}\n"
     )
