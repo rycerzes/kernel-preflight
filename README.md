@@ -53,7 +53,7 @@ TrueForge  (on the GPU host)
 └── MCP: kernel-preflight ──── the adjudicator, outside the agent's control
       ├── device_spec          hardware ceilings from the CUDA driver
       ├── preflight_kernel     compile → measure → gate, in isolation
-      └── publish_kernel       approval-gated; re-verifies before publishing
+      └── publish_kernel       approval-gated; re-verifies under the same contract
 ```
 
 **The agent submits source and never submits a number.** A candidate is compiled
@@ -61,6 +61,21 @@ TrueForge  (on the GPU host)
 input distribution, the timing loop, the reference and the tolerances. The
 documented ways of faking a kernel speedup are all properties of measurement code;
 making that code ours does not detect them, it makes them unrepresentable.
+
+Inside the container that is two processes, not one:
+
+```
+supervisor.py ──── holds the nonce and the output path (from stdin, never argv)
+  │                the only writer of a verdict; never loads candidate code
+  └── worker ───── driver.cu or driver.py, linked to or importing the candidate
+                   reports numbers on a descriptor; told neither secret
+```
+
+The split is the whole guarantee rather than a detail of it. A single process cannot
+both execute a candidate and be trusted to report on it, and while this was one
+process, two different candidates forged a 92%-of-peak verdict without launching a
+kernel — see
+[the finding that invalidated the premise, twice](#the-finding-that-invalidated-the-premise-twice).
 
 The gates:
 
@@ -85,7 +100,13 @@ inside one. Full write-up, including the four configurations tried, in
 
 ## Verified
 
-Measured on an RTX 4090 (sm_89, driver 580.159.04, CUDA 13.2), not asserted:
+Every number here is the harness's. A candidate submits source and never a number:
+the harness owns allocation, the input distribution, timing, the reference and the
+tolerances, and the candidate cannot reach any of them.
+
+### Infrastructure
+
+Measured on an RTX 4090 (sm_89, driver 580.159.04, CUDA 13.2):
 
 | Check | Result |
 | --- | --- |
@@ -96,24 +117,157 @@ Measured on an RTX 4090 (sm_89, driver 580.159.04, CUDA 13.2), not asserted:
 | `nvcc -arch=sm_89` compile + run inside the sandbox | 921.2 / 1008.1 GB/s = 91.4% of peak |
 | 5 MiB upload/download round-trip | byte-exact |
 | Agent end to end: skill → sandbox → gates | admitted at 91.1% of DRAM peak, first submission |
-| Adversarial kernels (`noop`, `cached`, `forge`) | all three rejected, each by a different gate |
+| Gate unit suite | 35/35 |
 
 The device ceiling is corroborated two ways: `preflight.device` derives
 **1008.1 GB/s** from the CUDA driver attribute API, and an independent CUDA C
 bandwidth kernel measures against the same figure.
 
-Run-to-run variance on identical code was **84.9% → 91.4% of peak** across three
-runs. That is why `variance` is a gate: a single timing sample is not evidence,
-including for this project's own numbers.
+### The kernel matrix
+
+28 cases in one session on one GPU, with a thermal cooldown between each so the
+figures are comparable — `benchmark/full_matrix.py`. A sweep run straight after
+Helion's autotuner once read a third of the throughput of the same kernel idle,
+which is why Helion is scheduled last and why the harness samples the SM clock and
+says so when it ran below peak.
+
+**17 admitted, 11 not, and every one of the 8 adversarial candidates rejected.**
+
+One op, five toolchains — the comparison the gates are indifferent to, because they
+adjudicate a measurement schema rather than a toolchain:
+
+| rmsnorm | fp32, % of the 1008.1 GB/s bus |
+| --- | --- |
+| hand-written CUDA | 90.1% |
+| TileLang | 90.7% |
+| Triton | 89.6% |
+| Helion (autotuned) | 89.1% |
+| CuTe DSL, one warp per row | 56.4% |
+| eager PyTorch | 26.2% |
+
+Memory-bound, other ops: CUDA softmax 90.2%, CUDA silu 91.2%, TileLang silu 90.6%,
+CuTe silu 88.6%, CUDA transpose 30.4%.
+
+Compute-bound, audited against the arithmetic ceiling rather than the bus:
+
+| kernel | declared | verdict |
+| --- | --- | --- |
+| Triton matmul, `input_precision="ieee"` | fp32 | 58.2% of fp32 pipelines |
+| Triton matmul, TF32 | fp32 | **rejected** — correctness, timed_work |
+| the same TF32 kernel | tf32 | 89.2% of tf32 pipelines |
+| torch SDPA | fp32 | 29.2% |
+| torch SDPA | bf16 | 93.1% |
+| Triton FlashAttention | fp32 | **rejected** — correctness, timed_work |
+| the same kernel | tf32 | 76.7% |
+| the same kernel | bf16 | 88.9% |
+
+Two independent sweeps of this matrix agree to within **0.3 points** on every
+memory-bound case and disagree by up to **6.8 points** on the compute-bound
+attention ones, which pick a different winning shape from run to run. That gap is
+the argument for `variance` being a gate rather than a note, and it is the reason a
+single number from a single run is not evidence — including for the numbers above.
+
+### Five results worth reading
+
+**One true value passes a check built to need the whole output.** `timed_work`
+exists to prove the *measured* calls did the work, and it asks two things: that
+something was written, and that what was written matches. Both are satisfiable by a
+single element, because the error is computed over the finite elements only — a NaN
+has no distance from anything. A candidate that computed correctly through warmup
+and then wrote one true value with NaN everywhere else, on every timed call, was
+admitted with all nine gates green. Both harnesses were already computing the flag
+that catches it and throwing it away.
+
+**Physics disproves a precision claim without needing the reference.**
+`cheat_silent_bf16.py` declares fp32 and quietly computes in bf16. It is caught
+three times over: 594x past the fp32 tolerance, wrong again when the output is
+re-read after timing, and at 100.9 TFLOP/s against an 83.1 TFLOP/s fp32 ceiling.
+The last catch needs no reference output at all — the arithmetic is impossible at
+the precision claimed.
+
+**The same kernel is honest at one precision and dishonest at another.** The Triton
+FlashAttention kernel is rejected as fp32 and admitted at tf32 and bf16, because
+`tl.dot` silently uses TF32. Nothing about the kernel changes. Declaring what you
+actually compute is the whole difference.
+
+**A toolchain's config is what gets measured.** A Helion config sweep on one kernel
+spans **4.7x** — `block_sizes=[1]` reaches 90% of the bus, `[32]` reaches 47%.
+Pinning a config measures that config.
+
+**The harness caught a measurement bug in my own candidate.** `cute_silu.py`
+reported 7.0% of the bus. That was `@cute.jit` re-tracing on every launch: the
+number was JIT dispatch, not the kernel. Hoisting the compile reports **88.6%**, a
+12.7x correction. A compiled CuTe function also silently accepts shapes it was not
+compiled for, so the caches are keyed on shape.
+
+### What it does not claim
+
+- **Hopper compute ceilings are absent on purpose.** The published figures do not
+  divide cleanly into a per-SM-per-clock constant that can be defended, so the gate
+  returns `UNVERIFIABLE_COMPUTE` rather than a guess. An unverifiable ceiling is
+  non-blocking and says so.
+- **Tensor-core ceilings are a floor, not a limit.** Within one compute capability
+  NVIDIA ships parts differing by exactly 2x — the RTX 3090 at 35.6 dense TF32
+  TFLOPS against the A40 at 74.8, both sm_86 — and
+  [states that the reason is unpublished](https://forums.developer.nvidia.com/t/tf32-tflops-of-geforce-rtx-3090-vs-a40/265828).
+  Utilisation is reported against the rate verified on this hardware, but a claim is
+  only refused past the widest rate any part of that capability is rated for. fp32
+  keeps a hard ceiling, and that is the axis the bf16 catch above runs on.
+- **fp16 is implemented and untested.** Only sm_89 hardware was available.
+- **The worker's numbers are bounded, not proven.** See
+  [the honest limits](#the-limit-this-does-not-clear).
+
+### Five false accusations
+
+A gate that flags correct work is worse than no gate, and this project has
+built that gate five times. Each of these rejected an honest kernel before it was
+fixed:
+
+| what it flagged | why it was wrong |
+| --- | --- |
+| baseline at 1820 GB/s on a 1008 GB/s bus | 34 MB fits in 72 MB of L2; DRAM does not bound cache-resident traffic |
+| fp32 attention diverging from fp64 | the anti-narrow-range input distribution spanned 2^24 in the softmax tail |
+| an honest kernel's timing variance | at `repeats=10`, `(10*9)//10` indexes the last sample, so p90 *was* max |
+| torch's own matmul at 2.8e-2 | pure relative error explodes where cancellation puts the reference near zero |
+| a kernel at a third of its throughput | measured after 900 s of autotuning, against a ceiling that assumes peak clock |
+
+### The limit this does not clear
+
+Two candidates in `examples/` forged the entire measurement and were admitted at
+92% of the bus without launching a kernel: `cheat_python_forge.py` read `--out` and
+`--nonce` from `sys.argv` at import, and `cheat_forge_proc.cu` recovered the same
+two values from `/proc/self/cmdline` inside a C++ static constructor. One process
+cannot both execute a candidate and be trusted to report on it.
+
+`supervisor.py` now takes those secrets on stdin, spawns the worker with neither,
+and is the only writer of the verdict — so a worker that exits early leaves nothing
+behind. Hiding the values better would not have worked: `/proc/<ppid>/cmdline` and
+`/proc/<ppid>/environ` are readable from inside the container, while
+`/proc/<ppid>/mem` and `ptrace` are refused, which is what makes a sibling process
+the right boundary rather than a more careful flag.
+
+What remains: the worker still reports its own numbers on a descriptor. They are
+bounded — by a duration the supervisor observed from outside, and by the roofline,
+variance and timed-work gates — but bounded is not proven. Proving them would move
+the timing authority outside the worker entirely, measuring a known quantity of
+work from the other side of the process boundary. That is a larger change than this,
+and it is not done.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `src/preflight/` | `harness/driver.cu` measures, `gates.py` adjudicates, `runner.py` isolates, `mcp_server.py` serves |
-| `src/preflight/harness/examples/` | a baseline and three adversarial kernels, kept as regression tests |
+| `src/preflight/harness/supervisor.py` | the only process that never runs candidate code, and the only writer of a verdict |
+| `src/preflight/harness/driver.cu`, `driver.py` | the measurement workers, one per backend, emitting the same schema |
+| `src/preflight/gates.py` | adjudicates that schema — nine gates, indifferent to the toolchain |
+| `src/preflight/runner.py` | isolation: container, no network, no inherited environment |
+| `src/preflight/mcp_server.py` | the three tools TrueForge sees |
+| `src/preflight/device.py` | hardware ceilings read from the CUDA driver attribute API |
+| `src/preflight/harness/examples/` | 17 honest kernels across five toolchains, 8 adversarial, 1 merely wrong — all regression tests |
+| `benchmark/full_matrix.py` | the 28-case sweep behind the table above |
+| `tests/` | 35 gate tests, including the ones that fail against the pre-fix code |
 | `agent/` | the saved TrueForge agent manifest |
-| `docker/` | the sandbox image: CUDA plus the Python the bootstrap needs |
+| `docker/` | the sandbox images: CUDA, plus torch/Triton/Helion/CuTe/TileLang |
 | `upstream/trueforge/` | changes to TrueForge itself, mirroring upstream paths for a clean PR |
 | `docs/` | investigation notes |
 
@@ -126,6 +280,8 @@ Every substantive change goes through a pull request reviewed by Qodo before mer
 | [#1, first pass](https://github.com/rycerzes/kernel-preflight/pull/1) | 5 High, 3 Medium | 7 fixed, 1 partially fixed with a documented scope note. [Full response](https://github.com/rycerzes/kernel-preflight/pull/1#issuecomment-5414904562) |
 | [#1, review of the fixes](https://github.com/rycerzes/kernel-preflight/pull/1) | 1 High, 2 Medium | all 3 fixed |
 | [#2, preflight agent](https://github.com/rycerzes/kernel-preflight/pull/2) | 6 findings | all 6 fixed. [Full response](https://github.com/rycerzes/kernel-preflight/pull/2#issuecomment-5420739404) |
+| [#3, benchmark and ops guide](https://github.com/rycerzes/kernel-preflight/pull/3) | 7 findings across two rounds | all 7 fixed |
+| [#4, six ops and six backends](https://github.com/rycerzes/kernel-preflight/pull/4) | 9 findings | all 9 fixed; one of them falsified the premise a second time |
 
 The second round reviewed the fixes themselves and found three second-order bugs,
 which is the review loop doing its job:
@@ -175,26 +331,67 @@ keyed on the wrong tuple field, and a regression test whose `grep` matched its o
 argv. Both are recorded in the PR response, because "the test passed" and "the fix
 works" are different claims.
 
-### The finding that invalidated the premise
+### The finding that invalidated the premise, twice
 
 Review of the agent PR found that a candidate could **forge its own verdict**. The
-harness prints its measurement, but the candidate is linked into the same binary
-and C++ static constructors run before `main`. A kernel with an empty body, whose
-constructor printed a fabricated measurement and exited, was **admitted at a
+harness printed its measurement to stdout, the candidate was linked into the same
+binary, and C++ static constructors run before `main`. A kernel with an empty body,
+whose constructor printed a fabricated measurement and exited, was **admitted at a
 plausible 91% of peak** — six gates, all green, for code that never launched
 anything.
 
 That is not a bug in a gate. It falsified the sentence at the top of this file.
 
-It is fixed by refusing to take stdout at face value: the harness must echo a
-nonce chosen after the candidate's source was fixed, and must account for
-wall-clock time the caller independently observed. Fabricated work cannot pay for
-time that never elapsed. The attack is committed as
-`src/preflight/harness/examples/cheat_forge.cu` so it stays a regression test.
+The first fix was to stop taking stdout at face value: the harness had to echo a
+nonce chosen after the candidate's source was fixed, and account for wall-clock time
+the caller independently observed. Fabricated work cannot pay for time that never
+elapsed. Later the measurement moved out of stdout entirely, into a file, which
+removed the channel `cheat_forge.cu` had used.
 
-The same review found that candidate code was being compiled and executed **on the
-host**, in the process environment holding the publishing token — while this
-repository was contributing a GPU container sandbox to TrueForge. Execution now
+**That fix was not enough, and review of PR #4 found why.** The nonce and the output
+path were still passed in `argv`, and the candidate was still running inside the
+process that wrote the verdict. Two new candidates read them straight back out:
+
+- `cheat_python_forge.py` — the Python harness imports candidates with
+  `exec_module`, so module-level code runs before anything is measured, with
+  `sys.argv` intact.
+- `cheat_forge_proc.cu` — a C++ static constructor is not passed `argv`, but
+  `/proc/self/cmdline` contains it.
+
+Both wrote a measurement claiming 92% of the memory bus and exited. Both were
+admitted, all nine gates green. The first fix had made forgery harder to reach
+without making it impossible, which is the difference between a mitigation and a
+boundary.
+
+Hiding the values better does not work, and this was measured rather than assumed:
+inside the container `/proc/<ppid>/cmdline` and `/proc/<ppid>/environ` are readable,
+while `/proc/<ppid>/mem` and `ptrace(PTRACE_ATTACH)` are refused with `EPERM`. So no
+flag and no environment variable can carry a secret past code running there — but a
+*sibling process* can hold one safely.
+
+That is the fix. `supervisor.py` takes the nonce and the output path on stdin,
+spawns the worker with neither, and is the only writer. It also stamps the wall time
+it observed itself, so the provenance check that the timed loops fit inside the run
+is finally made against a duration the measured code does not control. A worker that
+exits early now leaves nothing behind — which the runner already treats as a
+rejection, and which is exactly what both forges now do.
+
+Both attacks are committed as regression tests. The residual limit is stated in
+[what it does not claim](#what-it-does-not-claim): the worker still reports its own
+numbers, bounded by an observed duration and by the roofline, variance and
+timed-work gates, but bounded is not proven.
+
+The same review round also found that the tf32 correctness bar was 128x looser than
+the contract, that five of six input builders silently ignored a declared reduced
+precision, and that a merely *wrong* transpose came back as a JSON parse error
+instead of a correctness verdict. Nine findings, all fixed, each verified against
+the code or the hardware before being acted on — one of them,
+[a claim about GA10x tensor ceilings](https://forums.developer.nvidia.com/t/tf32-tflops-of-geforce-rtx-3090-vs-a40/265828),
+turned out to be a real risk of *falsely accusing* correct kernels.
+
+The earlier review also found that candidate code was being compiled and executed
+**on the host**, in the process environment holding the publishing token — while
+this repository was contributing a GPU container sandbox to TrueForge. Execution now
 happens in a container with no network and no inherited environment.
 
 ## Notes

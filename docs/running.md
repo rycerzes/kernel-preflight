@@ -134,3 +134,29 @@ Demonstrating the benefit needs a task that would otherwise overflow: many more
 iterations, several skills, or a much larger operator set. That measurement is
 not in this repository yet, and the honest summary is that on a task this size
 you should leave context management off.
+
+## Two traps that cost real time
+
+**A shadow package silently shadowed the real one.** An `rsync -az src/ tests/ host:repo/`
+with two sources copies the *contents* of each into the destination, so `src/preflight/`
+landed as `repo/preflight/`. Under `python3 -c` the working directory precedes
+`PYTHONPATH` on `sys.path`, so that stale copy won every import. The symptom was a
+backend reported as unknown while being present in both copies of the file.
+
+Fixed twice over: `sync.sh` purges `__pycache__` and syncs each tree to its own
+destination, and the matrix script asserts the module it imported is the one under
+`src/` before measuring anything. Any harness that can silently measure the wrong
+code is worse than no harness.
+
+**`rsync -a` preserves mtimes, so bytecode can look newer than source.** A synced
+`.py` older than the `.pyc` beside it leaves Python running the cache. Same family
+as forgetting to restart the MCP server, and the same fix: purge on sync.
+
+## Known flakiness
+
+The variance gate can still reject an honest kernel under sustained back-to-back
+load. Measured in isolation, `triton_matmul_tf32_declared` scores p90/median of
+1.00-1.06 across trials; inside an eighteen-case sweep it once exceeded the 2.0
+threshold, because a single sample spiked on a hot device. Batched timing removed
+the systematic version of this problem, not the tail. A trimmed statistic or a
+higher repeat count would close it; neither is implemented.
