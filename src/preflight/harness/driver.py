@@ -56,21 +56,10 @@ STORAGE_DTYPE = {
     "fp16": torch.float16,
 }
 
-# Mantissa bits, used to widen the correctness tolerance for a declared reduced
-# precision. bf16 keeps 7 against fp32's 23, so its results carry roughly 2^16
-# times more relative error and cannot be held to an fp32 bar.
-PRECISION_MANTISSA = {"fp32": 23, "tf32": 10, "bf16": 7, "fp16": 10}
-
-
 def storage_dtype(precision: str) -> torch.dtype:
     if precision not in STORAGE_DTYPE:
         raise SystemExit(f"unknown precision {precision!r}")
     return STORAGE_DTYPE[precision]
-
-
-def precision_tolerance_scale(precision: str) -> float:
-    """How much looser the tolerance must be than the fp32 baseline."""
-    return float(2 ** (23 - PRECISION_MANTISSA.get(precision, 23)))
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +163,8 @@ class Problem:
 
 
 def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
-    x = make_input((rows, cols), seed, dev)
-    w = make_input((cols,), seed ^ 0x5EED, dev)
+    x = make_input((rows, cols), seed, dev, dtype=dt)
+    w = make_input((cols,), seed ^ 0x5EED, dev, dtype=dt)
     eps = 1e-6
     xd, wd = x.double(), w.double()
     ref = xd * torch.rsqrt(xd.pow(2).mean(dim=-1, keepdim=True) + eps) * wd
@@ -194,7 +183,7 @@ def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype
 
 
 def _softmax(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
-    x = make_input((rows, cols), seed, dev)
+    x = make_input((rows, cols), seed, dev, dtype=dt)
     ref = torch.softmax(x.double(), dim=-1)
     n = rows * cols
     return Problem(
@@ -211,7 +200,7 @@ def _softmax(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype
 
 
 def _silu(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
-    x = make_input((rows, cols), seed, dev)
+    x = make_input((rows, cols), seed, dev, dtype=dt)
     xd = x.double()
     ref = xd * torch.sigmoid(xd)
     n = rows * cols
@@ -229,7 +218,7 @@ def _silu(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -
 
 
 def _transpose(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
-    x = make_input((rows, cols), seed, dev)
+    x = make_input((rows, cols), seed, dev, dtype=dt)
     ref = x.double().t().contiguous()
     n = rows * cols
     return Problem(
@@ -257,8 +246,8 @@ def _matmul(m: int, k: int, seed: int, dev: torch.device, dt: torch.dtype) -> Pr
     n = k
     # Bounded magnitudes: a 4096-deep dot product over values spanning 2^12 loses
     # more precision to cancellation than any tolerance should forgive.
-    a = make_input((m, k), seed, dev, exponent_range=0)
-    b = make_input((k, n), seed ^ 0xB00, dev, exponent_range=0)
+    a = make_input((m, k), seed, dev, exponent_range=0, dtype=dt)
+    b = make_input((k, n), seed ^ 0xB00, dev, exponent_range=0, dtype=dt)
     ref = a.double() @ b.double()
     return Problem(
         label=f"{m}x{k}x{n}",
@@ -407,7 +396,8 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
     key = next(iter(problem.inputs))
     original = problem.inputs[key].clone()
     problem.inputs[key].copy_(
-        make_input(tuple(original.shape), 0xA5A5A5, original.device, exponent_range=0)
+        make_input(tuple(original.shape), 0xA5A5A5, original.device,
+                   exponent_range=0, dtype=original.dtype)
     )
     launch(problem.inputs, out, problem.meta)
     torch.cuda.synchronize()

@@ -229,6 +229,21 @@ Deviation compare(const std::vector<float>& got, const std::vector<double>& want
   return d;
 }
 
+// JSON has no literal for infinity or NaN, and "%.6g" prints them as `inf` and
+// `nan`, which no strict parser accepts. A bit-exact op sets violation to infinity
+// for any difference at all, so a merely *wrong* transpose used to come back as
+// "measurement file is not JSON" -- an exception in the caller instead of the
+// correctness verdict it should have been.
+//
+// Clamping loses no information the gates use: every threshold is a comparison
+// against 1.0, so 1e308 and infinity fail identically. NaN clamps to the failing
+// end deliberately, since a NaN error is not a passing one.
+double json_double(double v) {
+  if (std::isnan(v)) return 1e308;
+  if (std::isinf(v)) return v < 0.0 ? -1e308 : 1e308;
+  return v;
+}
+
 double checksum(const std::vector<float>& v) {
   // Order-dependent mix, so a permuted or partially-written buffer differs.
   double acc = 0.0;
@@ -505,11 +520,16 @@ int main(int argc, char** argv) {
                 "\"wrote_output\": %s, \"input_sensitive\": %s, "
                 "\"inner_iters\": %d, \"timed_output_written\": %s, \"timed_max_rel_err\": %.6g, \"timed_violation\": %.6g, "
                 "\"rel_tol\": %.6g, \"bytes_moved\": %.1f, \"flops\": %.1f, \"working_set_bytes\": %.1f}%s\n",
-                r.rows, r.cols, r.min_ms, r.median_ms, r.p90_ms, r.p25_ms, r.p75_ms, r.outliers, r.max_ms, r.max_abs_err, r.max_rel_err, r.violation,
+                r.rows, r.cols, json_double(r.min_ms), json_double(r.median_ms),
+                json_double(r.p90_ms), json_double(r.p25_ms), json_double(r.p75_ms),
+                r.outliers, json_double(r.max_ms), json_double(r.max_abs_err),
+                json_double(r.max_rel_err), json_double(r.violation),
                 r.has_nonfinite ? "true" : "false", r.wrote_output ? "true" : "false",
                 r.input_sensitive ? "true" : "false",
-                r.inner_iters, r.timed_output_written ? "true" : "false", r.timed_max_rel_err, r.timed_violation,
-                r.rel_tol, r.bytes_moved, r.flops, r.working_set_bytes,
+                r.inner_iters, r.timed_output_written ? "true" : "false",
+                json_double(r.timed_max_rel_err), json_double(r.timed_violation),
+                json_double(r.rel_tol), json_double(r.bytes_moved), json_double(r.flops),
+                json_double(r.working_set_bytes),
                 i + 1 == shape_count ? "" : ",");
   }
   std::fprintf(out, "  ],\n");

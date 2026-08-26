@@ -130,3 +130,114 @@ def test_cache_resident_shapes_are_not_audited_on_memory() -> None:
 def test_non_positive_time_is_rejected(median_ms: float) -> None:
     result = check_roofline(measurement(flops=WORKING_SET, median_ms=median_ms))
     assert result.status is GateStatus.FAIL
+
+
+# ---------------------------------------------------------------------------
+# Tensor-core ceilings and the SKU spread
+# ---------------------------------------------------------------------------
+#
+# Within one compute capability NVIDIA ships parts whose tensor throughput differs
+# by exactly 2x -- RTX 3090 at 35.6 dense TF32 TFLOPS against A40 at 74.8, both
+# compute capability 8.6 -- and states that the reason is unpublished. A ceiling
+# keyed on capability alone therefore cannot be a limit for every part reporting it,
+# and one that is too low does not weaken the gate, it makes it accuse correct work.
+
+
+from preflight.gates import TENSOR_SKU_SPREAD  # noqa: E402
+
+
+def tensor_measurement(*, precision: str, flops: float, median_ms: float,
+                       per_sm_clock: int) -> dict:
+    """A compute-bound claim at a tensor precision on an sm_86-class part."""
+    m = measurement(flops=flops, median_ms=median_ms,
+                    peak_flops=128 * 1.7e9 * per_sm_clock)
+    m["precision"] = precision
+    m["compute_capability"] = "8.6"
+    m["sm_count"] = 128
+    m["sm_clock_hz"] = 1.7e9
+    return m
+
+
+def _tf32_claim(multiple_of_tabulated: float) -> dict:
+    """A TF32 claim at a chosen multiple of the tabulated (consumer) ceiling."""
+    per_clock = 256
+    ceiling = 128 * 1.7e9 * per_clock
+    flops = 1000 * WORKING_SET  # far above the ridge, so the SMs bind
+    seconds = flops / (ceiling * multiple_of_tabulated)
+    return tensor_measurement(precision="tf32", flops=flops,
+                              median_ms=seconds * 1000, per_sm_clock=per_clock)
+
+
+def test_tensor_claim_within_the_tabulated_ceiling_passes() -> None:
+    result = check_roofline(_tf32_claim(0.8))
+    assert result.status is GateStatus.PASS
+    assert "tf32 pipelines" in result.detail
+
+
+def test_professional_sku_rate_is_not_called_impossible() -> None:
+    """The regression: 1.8x the consumer rate is a real A40/A6000 measurement."""
+    result = check_roofline(_tf32_claim(1.8))
+    assert result.status is not GateStatus.FAIL, result.detail
+    assert result.status is GateStatus.UNVERIFIABLE_COMPUTE
+    assert not result.blocking
+    assert "without publishing the difference" in result.detail
+
+
+def test_beyond_the_widest_published_rate_is_still_impossible() -> None:
+    result = check_roofline(_tf32_claim(TENSOR_SKU_SPREAD * 1.5))
+    assert result.status is GateStatus.FAIL
+    assert "physically impossible" in result.detail
+
+
+def test_impossible_multiple_is_reported_against_the_widest_ceiling() -> None:
+    """Saying "3x the maximum" when it is 3x a rate some parts double is wrong."""
+    result = check_roofline(_tf32_claim(6.0))
+    assert result.status is GateStatus.FAIL
+    assert "3.0x the hardware maximum" in result.detail
+
+
+def test_fp32_keeps_a_hard_ceiling() -> None:
+    """fp32 runs on CUDA cores at 2 FLOP/core/clock on every part of a capability,
+    so it gets no headroom -- this is the axis that caught the undeclared bf16."""
+    per_clock = 256
+    ceiling = 128 * 1.7e9 * per_clock
+    flops = 1000 * WORKING_SET
+    seconds = flops / (ceiling * 1.2)
+    m = tensor_measurement(precision="fp32", flops=flops,
+                           median_ms=seconds * 1000, per_sm_clock=per_clock)
+    result = check_roofline(m)
+    assert result.status is GateStatus.FAIL
+    assert "1.2x the hardware maximum" in result.detail
+
+
+def test_implausibly_high_is_not_flagged_at_tensor_precisions() -> None:
+    """94% of a ceiling some parts double says nothing about the measurement."""
+    assert check_roofline(_tf32_claim(0.97)).status is GateStatus.PASS
+
+
+def test_implausibly_high_is_still_flagged_at_fp32() -> None:
+    per_clock = 256
+    ceiling = 128 * 1.7e9 * per_clock
+    flops = 1000 * WORKING_SET
+    seconds = flops / (ceiling * 0.97)
+    m = tensor_measurement(precision="fp32", flops=flops,
+                           median_ms=seconds * 1000, per_sm_clock=per_clock)
+    result = check_roofline(m)
+    assert result.status is GateStatus.FAIL
+    assert "points at the measurement" in result.detail
+
+
+def test_all_resident_arithmetic_without_a_ceiling_is_unverifiable() -> None:
+    """Not NOT_APPLICABLE: nothing was checked, which is not nothing to check."""
+    m = measurement(flops=WORKING_SET * 1000, median_ms=0.6, peak_flops=0.0)
+    m["shapes"][0]["working_set_bytes"] = 8 * 1024 * 1024  # inside L2
+    result = check_roofline(m)
+    assert result.status is GateStatus.UNVERIFIABLE_COMPUTE
+    assert not result.blocking
+
+
+def test_all_resident_without_arithmetic_is_not_applicable() -> None:
+    """Transpose does no arithmetic, so a missing compute ceiling costs nothing."""
+    m = measurement(flops=0.0, median_ms=0.6, peak_flops=0.0)
+    m["shapes"][0]["working_set_bytes"] = 8 * 1024 * 1024
+    assert check_roofline(m).status is GateStatus.NOT_APPLICABLE

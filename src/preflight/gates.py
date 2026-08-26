@@ -91,6 +91,21 @@ L2_CLEARANCE = 2.0
 # Absent entries are deliberate. Hopper's figures do not divide cleanly with the
 # clocks available here, so rather than guess, a kernel on an unlisted device or
 # precision is reported unverifiable on the compute axis.
+#
+# The tensor-core rows are a *lower* bound on what the capability can do, not the
+# figure for every part that reports it. Within one compute capability NVIDIA ships
+# SKUs whose tensor throughput differs by exactly 2x: the RTX 3090 is rated at 35.6
+# dense TF32 TFLOPS and the A40 at 74.8, and both are compute capability 8.6. Asked
+# about it directly, NVIDIA's answer was that "the TC units in each of those 2 GPUs
+# do not necessarily act in precisely the same way" and that "the detail description
+# of the differences is unpublished". The same 2x gap separates the RTX 4090 from the
+# RTX 6000 Ada at 8.9.
+#
+# So these values are the consumer rate, which is the rate verified on the hardware
+# this was developed against. They are right for reporting utilisation on such a
+# part and wrong by 2x as a limit for a professional one -- and a ceiling that is
+# too low does not weaken the gate, it makes it accuse correct kernels. See
+# TENSOR_SKU_SPREAD.
 DENSE_FLOPS_PER_SM_CLOCK: dict[tuple[int, int], dict[str, int]] = {
     (7, 0): {"fp32": 128, "fp16": 1024},                              # V100
     (7, 5): {"fp32": 128, "fp16": 1024},                              # T4, Turing
@@ -98,6 +113,22 @@ DENSE_FLOPS_PER_SM_CLOCK: dict[tuple[int, int], dict[str, int]] = {
     (8, 6): {"fp32": 256, "tf32": 256, "fp16": 512, "bf16": 512},     # GA10x
     (8, 9): {"fp32": 256, "tf32": 256, "fp16": 512, "bf16": 512},     # Ada
 }
+
+# Precisions that execute on tensor cores, and therefore carry the SKU uncertainty
+# described above. fp32 does not: it runs on the CUDA cores, where the rate is
+# 2 FLOP per core per clock on every part of a given capability, which is why the
+# fp32 rows can be trusted as limits rather than merely as reference points.
+TENSOR_PRECISIONS = ("tf32", "bf16", "fp16")
+
+# How far above the tabulated tensor ceiling a claim must land before it can be
+# called impossible rather than merely unverifiable. Exactly the published spread
+# between consumer and professional parts of the same compute capability.
+#
+# This costs the gate sensitivity on tensor-core precisions and is still the right
+# trade. The failure this exists to catch was ~30x above the hardware maximum, so a
+# 2x margin does not hide it -- and a false accusation of a correct kernel is the
+# more expensive mistake, which this project has now made five times.
+TENSOR_SKU_SPREAD = 2.0
 
 # Mantissa bits per precision class, used to scale the correctness tolerance. A
 # TF32 multiply keeps 10 bits against fp32's 23, so its results carry roughly
@@ -133,6 +164,16 @@ def _shape_label(shape: dict[str, Any]) -> str:
 # TF32 rounds operands to 10 mantissa bits and accumulates in fp32, so its error
 # is operand quantisation: a flat bar, with the usual safety factor.
 TF32_TOLERANCE = 8.0 * 2.0 ** -(MANTISSA_BITS["tf32"] + 1)
+
+
+def _times(x: float) -> str:
+    """Multiples of tolerance, readable at both ends of the range.
+
+    A bit-exact op reports an effectively infinite violation for any difference at
+    all, which the CUDA harness clamps to 1e308 so the JSON stays parseable. `.1f`
+    renders that as three hundred digits.
+    """
+    return f"{x:.3g}" if x >= 1e4 else f"{x:.1f}"
 
 
 def _violation_scale(measurement: dict[str, Any], shape: dict[str, Any]) -> float:
@@ -192,7 +233,7 @@ def check_correctness(measurement: dict[str, Any]) -> GateResult:
             return GateResult(
                 "correctness",
                 GateStatus.FAIL,
-                f"{_shape_label(shape)} exceeds the {precision} tolerance by {violation:.1f}x "
+                f"{_shape_label(shape)} exceeds the {precision} tolerance by {_times(violation)}x "
                 f"(max abs error {shape['max_abs_err']:.3g}). If the kernel deliberately "
                 f"computes in reduced precision it must declare it; an undeclared downgrade "
                 f"buys speed with accuracy the caller did not agree to",
@@ -318,13 +359,18 @@ def check_roofline(measurement: dict[str, Any]) -> GateResult:
             fraction = (flops / seconds) / peak_flops
             worst_candidate = (fraction, label, "compute", flops / seconds / 1e12, peak_flops / 1e12)
         else:
-            if shape["working_set_bytes"] < threshold:
-                resident.append(label)
-                continue
             if ridge is None and intensity > 0:
                 # No compute ceiling available and the op does arithmetic: a
                 # memory-side pass cannot rule out a compute-side impossibility.
+                # Recorded before the residency check below, not after: a shape
+                # that fits in L2 is equally unaudited on the compute side, and
+                # skipping it here once let an all-resident arithmetic run report
+                # NOT_APPLICABLE, which reads as "nothing to check" rather than
+                # "nothing was checked".
                 unbounded.append(label)
+            if shape["working_set_bytes"] < threshold:
+                resident.append(label)
+                continue
             achieved = shape["bytes_moved"] / seconds
             fraction = achieved / peak_bw
             worst_candidate = (fraction, label, "memory", achieved / 1e9, peak_bw / 1e9)
@@ -333,25 +379,56 @@ def check_roofline(measurement: dict[str, Any]) -> GateResult:
             worst = worst_candidate
 
     if worst is None:
-        return GateResult(
-            "roofline",
-            GateStatus.NOT_APPLICABLE,
+        resident_note = (
             f"every shape fits within {L2_CLEARANCE:g}x L2 ({l2 / 1e6:.0f} MB); "
-            "DRAM bandwidth does not bound cache-resident traffic",
+            "DRAM bandwidth does not bound cache-resident traffic"
         )
+        if unbounded:
+            # Nothing was auditable on either axis: the bus does not bind
+            # cache-resident traffic, and there is no compute ceiling to bind
+            # instead. That is not the same as there being nothing to check.
+            return GateResult(
+                "roofline",
+                GateStatus.UNVERIFIABLE_COMPUTE,
+                f"{resident_note}, and {ceiling_note}, so neither ceiling could bound this run",
+            )
+        return GateResult("roofline", GateStatus.NOT_APPLICABLE, resident_note)
 
     fraction, label, bound, achieved_scaled, ceiling_scaled = worst
     units = "GB/s" if bound == "memory" else "TFLOP/s"
     ceiling_name = "memory bus" if bound == "memory" else f"{precision} pipelines"
 
-    if fraction > 1.0:
+    # The tabulated tensor ceiling is the consumer rate, and a professional part of
+    # the same compute capability runs at twice it. So the number the gate reports
+    # utilisation against and the number it will call impossible are not the same:
+    # report against the best figure for this class of device, but only refuse a
+    # claim that exceeds the highest rate any part of this capability is rated for.
+    # The memory bus needs none of this -- bandwidth is read from the device.
+    headroom = (
+        TENSOR_SKU_SPREAD
+        if bound == "compute" and precision in TENSOR_PRECISIONS
+        else 1.0
+    )
+
+    if fraction > headroom:
         return GateResult(
             "roofline",
             GateStatus.FAIL,
-            f"{label} implies {achieved_scaled:.1f} {units} against a {ceiling_scaled:.1f} {units} "
-            f"{ceiling_name} ceiling ({fraction:.1f}x the hardware maximum) — physically impossible",
+            f"{label} implies {achieved_scaled:.1f} {units} against a "
+            f"{ceiling_scaled * headroom:.1f} {units} {ceiling_name} ceiling "
+            f"({fraction / headroom:.1f}x the hardware maximum) — physically impossible",
         )
-    if fraction > IMPLAUSIBLE_FRACTION:
+    if headroom > 1.0 and fraction > 1.0:
+        return GateResult(
+            "roofline",
+            GateStatus.UNVERIFIABLE_COMPUTE,
+            f"{label} implies {achieved_scaled:.1f} {units}, above the {ceiling_scaled:.1f} "
+            f"{units} {ceiling_name} ceiling for a consumer part but within the {headroom:g}x "
+            f"spread NVIDIA ships across SKUs of compute capability "
+            f"{measurement.get('compute_capability', '?')} without publishing the difference; "
+            f"this cannot be called impossible on the figures available",
+        )
+    if headroom == 1.0 and fraction > IMPLAUSIBLE_FRACTION:
         return GateResult(
             "roofline",
             GateStatus.FAIL,
@@ -470,7 +547,8 @@ def check_timed_work(measurement: dict[str, Any]) -> GateResult:
             return GateResult(
                 "timed_work",
                 GateStatus.FAIL,
-                f"output after timing is wrong at {label} ({err:.1f}x tolerance); the measured "
+                f"output after timing is wrong at {label} "
+                f"({_times(err / _violation_scale(measurement, shape))}x tolerance); the measured "
                 f"calls did not do the same work as the warmup",
             )
     return GateResult("timed_work", GateStatus.PASS, "the measured calls produced correct output")

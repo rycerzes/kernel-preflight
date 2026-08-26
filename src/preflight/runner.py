@@ -40,6 +40,8 @@ PYTHON_DRIVER = HARNESS_DIR / "driver.py"
 # Shared by both backends: the one process in the container that never runs
 # candidate code, and therefore the only one trusted to write a verdict.
 SUPERVISOR = HARNESS_DIR / "supervisor.py"
+# Reaping a timed-out container should not itself be able to hang.
+CONTAINER_KILL_TIMEOUT_S = 30
 DEFAULT_ARCH = "sm_89"
 # Operations the harness can measure. Each supplies its own double-precision host
 # reference; the candidate signature is shared, and ops without a weight vector or
@@ -57,6 +59,13 @@ SUPPORTED_BACKENDS = ("cuda", *PYTHON_BACKENDS)
 # undeclared downgrade is a correctness failure, because the speed was bought with
 # accuracy the caller did not agree to.
 SUPPORTED_PRECISIONS = ("fp32", "tf32", "bf16", "fp16")
+# Not every backend can honour every contract. driver.cu allocates float buffers,
+# hands the candidate float pointers, and charges traffic at 4 bytes an element, so
+# it cannot offer bf16 or fp16 storage -- accepting them let a CUDA candidate claim
+# a reduced precision, receive the widened tolerance that goes with it, and be
+# measured as fp32 anyway. tf32 is fine there: it is a compute mode over fp32
+# storage, so the buffers are already the right shape and only the metadata differs.
+PRECISIONS_BY_BACKEND = {"cuda": ("fp32", "tf32")}
 CUDA_IMAGE = "kernel-preflight-sandbox:cuda13"
 # Separate image: the Python backends need torch, Triton and Helion and never
 # invoke nvcc, so a CUDA-only preflight should not pay for a multi-gigabyte
@@ -127,10 +136,17 @@ def _run_in_container(
     gpus: str | None,
     stdin_data: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    # Named so a timeout has something to kill. `--rm` only removes a container
+    # after it exits, and killing the `docker run` client does not stop the
+    # container it started -- a hanging candidate would otherwise keep the GPU
+    # busy after the request that started it had already given up.
+    container = f"kernel-preflight-{secrets.token_hex(6)}"
     docker_args = [
         _docker(),
         "run",
         "--rm",
+        "--name",
+        container,
         # No network: a candidate cannot phone home with anything it finds.
         "--network",
         "none",
@@ -184,9 +200,31 @@ def _run_in_container(
     if gpus:
         docker_args += ["--gpus", gpus]
     docker_args += [image, *argv]
-    return subprocess.run(
-        docker_args, capture_output=True, text=True, timeout=timeout_s, input=stdin_data,
-    )
+    try:
+        return subprocess.run(
+            docker_args, capture_output=True, text=True, timeout=timeout_s, input=stdin_data,
+        )
+    except subprocess.TimeoutExpired:
+        _kill_container(container)
+        raise
+
+
+def _kill_container(name: str) -> None:
+    """Stop a container we started, on the way out of a timeout.
+
+    Best effort by design: the container may have exited on its own between the
+    timeout firing and this call, and a failure to reap it must not replace the
+    timeout the caller is already handling with a less informative error.
+    """
+    try:
+        subprocess.run(
+            [_docker(), "kill", name],
+            capture_output=True,
+            text=True,
+            timeout=CONTAINER_KILL_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def preflight_source(
@@ -214,6 +252,12 @@ def preflight_source(
     if precision not in SUPPORTED_PRECISIONS:
         raise CompileError(
             f"unknown precision {precision!r}; supported: {', '.join(SUPPORTED_PRECISIONS)}"
+        )
+    allowed_precisions = PRECISIONS_BY_BACKEND.get(backend, SUPPORTED_PRECISIONS)
+    if precision not in allowed_precisions:
+        raise CompileError(
+            f"backend {backend!r} cannot honour precision {precision!r}; it supports "
+            f"{', '.join(allowed_precisions)}. Reduced-storage kernels need a Python backend."
         )
     resolved_image = image or (CUDA_IMAGE if backend == "cuda" else PYTHON_IMAGE)
 
