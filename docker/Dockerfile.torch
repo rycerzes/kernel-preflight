@@ -35,5 +35,22 @@ import torch, triton, helion, importlib.metadata as m; \
 print('torch', torch.__version__, 'triton', m.version('triton'), 'helion', m.version('helion')); \
 assert hasattr(torch.nn.functional, 'scaled_dot_product_attention')"
 
+# Two more kernel DSLs, appended after the torch layer on purpose: inserting a
+# step before it invalidates the cache and re-downloads several gigabytes.
+#
+# nvidia-cutlass-dsl 4.7.0 rather than 4.7.1, which was published today and fails
+# the 7-day release-age floor. The [cu13] extra matches the CUDA 13 toolkit here.
+# CuTe DSL is in public beta, which is worth knowing when reading its numbers.
+RUN pip3 install --no-cache-dir --break-system-packages \
+      "nvidia-cutlass-dsl[cu13]==4.7.0"
+
+# TileLang builds on TVM and is explicitly validated on the RTX 4090, which is
+# the device this harness measures.
+RUN pip3 install --no-cache-dir --break-system-packages tilelang==0.1.13
+
+RUN python3 -c "\
+import cutlass, tilelang, importlib.metadata as m; \
+print('cutlass-dsl', m.version('nvidia-cutlass-dsl'), 'tilelang', m.version('tilelang'))"
+
 ENTRYPOINT []
 CMD ["sleep", "infinity"]

@@ -47,7 +47,7 @@ DEFAULT_ARCH = "sm_89"
 # know or care which produced a verdict.
 CUDA_OPS = ("rmsnorm", "softmax", "silu", "transpose")
 PYTHON_OPS = ("rmsnorm", "softmax", "silu", "transpose", "matmul", "attention")
-PYTHON_BACKENDS = ("triton", "helion", "torch")
+PYTHON_BACKENDS = ("triton", "helion", "torch", "cute", "tilelang")
 SUPPORTED_BACKENDS = ("cuda", *PYTHON_BACKENDS)
 # The numerical contract a candidate claims. Declaring a reduced precision widens
 # the correctness tolerance and changes which hardware ceiling binds; an
@@ -68,6 +68,11 @@ PYTHON_RUN_TIMEOUT_S = 2400
 # satisfied. Bounded so a sweep terminates; the search happens during warmup, so
 # it never enters a timed sample.
 HELION_AUTOTUNE_BUDGET_S = 30
+# The harness writes its measurement here, inside the bind mount, rather than to
+# stdout. stdout is shared with every library the candidate imports -- TileLang
+# logs there unconditionally -- and it is also the channel a candidate could print
+# a forged measurement on.
+MEASUREMENT_FILE = "measurement.json"
 # Container guardrails. Generous enough for nvcc, tight enough that a runaway
 # candidate cannot take the host with it.
 CONTAINER_MEMORY = "8g"
@@ -229,7 +234,7 @@ def preflight_source(
                 raise CompileError(compile_proc.stderr.strip() or "nvcc failed with no diagnostics")
             compile_log = compile_proc.stderr.strip()
             nonce = secrets.token_hex(16)
-            run_argv = ["./preflight", op, str(repeats), str(seed), nonce, precision]
+            run_argv = ["./preflight", op, str(repeats), str(seed), nonce, precision, MEASUREMENT_FILE]
         else:
             # Python backends JIT at run time, so there is no separate compile
             # step; a syntax error surfaces as a harness failure instead.
@@ -244,6 +249,7 @@ def preflight_source(
                 "--seed", str(seed),
                 "--nonce", nonce,
                 "--precision", precision,
+                "--out", MEASUREMENT_FILE,
             ]
 
         started = time.monotonic()
@@ -264,10 +270,17 @@ def preflight_source(
             raise HarnessError(
                 f"harness exited {run_proc.returncode}: {(run_proc.stderr or run_proc.stdout).strip()[:800]}"
             )
+        measurement_path = workdir / MEASUREMENT_FILE
+        if not measurement_path.exists():
+            raise HarnessError(
+                f"harness wrote no measurement: {(run_proc.stderr or run_proc.stdout).strip()[:500]}"
+            )
         try:
-            measurement = json.loads(run_proc.stdout)
+            measurement = json.loads(measurement_path.read_text())
         except json.JSONDecodeError as exc:
-            raise HarnessError(f"harness did not emit JSON: {run_proc.stdout[:300]}") from exc
+            raise HarnessError(
+                f"measurement file is not JSON: {measurement_path.read_text()[:300]}"
+            ) from exc
         if "error" in measurement:
             raise HarnessError(str(measurement["error"]))
 

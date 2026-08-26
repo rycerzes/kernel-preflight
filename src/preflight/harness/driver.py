@@ -473,6 +473,13 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=20260826)
     parser.add_argument("--nonce", default="")
     parser.add_argument(
+        "--out",
+        required=True,
+        help="Path to write the measurement JSON. Not stdout: stdout is a shared "
+             "channel that any imported library can log into, and TileLang does. It is "
+             "also the channel a candidate could print a forged measurement on.",
+    )
+    parser.add_argument(
         "--precision",
         default="fp32",
         help="Numerical contract the candidate claims to honour: fp32, tf32, bf16 or fp16. "
@@ -482,7 +489,8 @@ def main() -> int:
 
     started = time.perf_counter()
     if not torch.cuda.is_available():
-        print(json.dumps({"error": "CUDA unavailable"}))
+        with open(args.out, "w") as handle:
+            json.dump({"error": "CUDA unavailable"}, handle)
         return 3
 
     builder, shapes = OPS[args.op]
@@ -507,7 +515,8 @@ def main() -> int:
 
     payload["shapes"] = shapes_out
     payload["harness_wall_ms"] = (time.perf_counter() - started) * 1000.0
-    print(json.dumps(payload))
+    with open(args.out, "w") as handle:
+        json.dump(payload, handle)
     return 0
 
 

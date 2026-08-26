@@ -422,6 +422,14 @@ int main(int argc, char** argv) {
   // Numerical contract the candidate claims to honour. Sets the correctness
   // tolerance and selects the hardware ceiling the roofline gate applies.
   const char* precision = argc > 5 ? argv[5] : "fp32";
+  // Written to a file rather than stdout: stdout is shared with anything else the
+  // process links, and is the channel a candidate could forge a measurement on.
+  const char* out_path = argc > 6 ? argv[6] : "measurement.json";
+  std::FILE* out = std::fopen(out_path, "w");
+  if (out == nullptr) {
+    std::fprintf(stderr, "cannot open %s for writing\n", out_path);
+    return 4;
+  }
   if (repeats < 5) repeats = 5;
 
   // Several shapes, so specialising to one is visible as failure on the others.
@@ -438,20 +446,20 @@ int main(int argc, char** argv) {
   cudaDeviceProp props{};
   CUDA_CHECK(cudaGetDeviceProperties(&props, 0));
 
-  std::printf("{\n");
-  std::printf("  \"nonce\": \"%s\",\n", nonce);
-  std::printf("  \"op\": \"%s\",\n", op->name);
-  std::printf("  \"precision\": \"%s\",\n", precision);
-  std::printf("  \"op\": \"%s\",\n", op->name);
-  std::printf("  \"precision\": \"%s\",\n", precision);
-  std::printf("  \"device\": \"%s\",\n", props.name);
-  std::printf("  \"compute_capability\": \"%d.%d\",\n", props.major, props.minor);
-  std::printf("  \"peak_bandwidth_bytes_per_s\": %.1f,\n",
+  std::fprintf(out, "{\n");
+  std::fprintf(out, "  \"nonce\": \"%s\",\n", nonce);
+  std::fprintf(out, "  \"op\": \"%s\",\n", op->name);
+  std::fprintf(out, "  \"precision\": \"%s\",\n", precision);
+  std::fprintf(out, "  \"op\": \"%s\",\n", op->name);
+  std::fprintf(out, "  \"precision\": \"%s\",\n", precision);
+  std::fprintf(out, "  \"device\": \"%s\",\n", props.name);
+  std::fprintf(out, "  \"compute_capability\": \"%d.%d\",\n", props.major, props.minor);
+  std::fprintf(out, "  \"peak_bandwidth_bytes_per_s\": %.1f,\n",
               2.0 * static_cast<double>(mem_clock_khz) * 1e3 * (bus_width_bits / 8.0));
   // Needed to tell DRAM-served traffic from cache-resident traffic. A working
   // set that fits in L2 never crosses the memory bus, so the DRAM roofline does
   // not bound it and a correct kernel can legitimately appear to exceed peak.
-  std::printf("  \"l2_cache_bytes\": %d,\n", props.l2CacheSize);
+  std::fprintf(out, "  \"l2_cache_bytes\": %d,\n", props.l2CacheSize);
   // Zero when the lane count for this architecture is unknown. The auditor must
   // treat that as "no compute ceiling available", not as "zero FLOPs".
   {
@@ -459,17 +467,17 @@ int main(int argc, char** argv) {
     double peak_flops = lanes == 0 ? 0.0
                                    : static_cast<double>(props.multiProcessorCount) * lanes * 2.0 *
                                          (static_cast<double>(sm_clock_khz) * 1e3);
-    std::printf("  \"peak_fp32_flops\": %.1f,\n", peak_flops);
-    std::printf("  \"sm_count\": %d,\n", props.multiProcessorCount);
+    std::fprintf(out, "  \"peak_fp32_flops\": %.1f,\n", peak_flops);
+    std::fprintf(out, "  \"sm_count\": %d,\n", props.multiProcessorCount);
     // So the auditor can build a ceiling for any precision class.
-    std::printf("  \"sm_clock_hz\": %.1f,\n", static_cast<double>(sm_clock_khz) * 1e3);
+    std::fprintf(out, "  \"sm_clock_hz\": %.1f,\n", static_cast<double>(sm_clock_khz) * 1e3);
   }
-  std::printf("  \"repeats\": %d,\n", repeats);
-  std::printf("  \"seed\": %u,\n", seed);
-  std::printf("  \"shapes\": [\n");
+  std::fprintf(out, "  \"repeats\": %d,\n", repeats);
+  std::fprintf(out, "  \"seed\": %u,\n", seed);
+  std::fprintf(out, "  \"shapes\": [\n");
   for (int i = 0; i < shape_count; ++i) {
     ShapeResult r = measure(*op, shapes[i][0], shapes[i][1], repeats, seed + static_cast<unsigned int>(i));
-    std::printf("    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"p90_ms\": %.6f, \"max_ms\": %.6f, "
+    std::fprintf(out, "    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"p90_ms\": %.6f, \"max_ms\": %.6f, "
                 "\"max_abs_err\": %.6g, \"max_rel_err\": %.6g, \"violation\": %.6g, \"has_nonfinite\": %s, "
                 "\"wrote_output\": %s, \"input_sensitive\": %s, "
                 "\"inner_iters\": %d, \"timed_output_written\": %s, \"timed_max_rel_err\": %.6g, \"timed_violation\": %.6g, "
@@ -481,12 +489,13 @@ int main(int argc, char** argv) {
                 r.rel_tol, r.bytes_moved, r.flops, r.working_set_bytes,
                 i + 1 == shape_count ? "" : ",");
   }
-  std::printf("  ],\n");
+  std::fprintf(out, "  ],\n");
   // Self-reported wall time. The caller compares this against the elapsed
   // time it measured for the whole process; a forged result printed before
   // any work happened cannot account for time it never spent.
-  std::printf("  \"harness_wall_ms\": %.3f\n}\n",
+  std::fprintf(out, "  \"harness_wall_ms\": %.3f\n}\n",
               std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now() - harness_start).count());
+  std::fclose(out);
   return 0;
 }

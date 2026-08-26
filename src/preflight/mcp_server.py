@@ -67,7 +67,7 @@ def preflight_kernel(
     ] = "rmsnorm",
     arch: Annotated[str, Field(description="Target architecture, e.g. sm_89.")] = "sm_89",
     backend: Annotated[
-        str, Field(description="Toolchain: cuda, triton, helion or torch.")
+        str, Field(description="Toolchain: cuda, triton, helion, torch, cute (CUTLASS CuTe DSL) or tilelang.")
     ] = "cuda",
     precision: Annotated[
         str,
