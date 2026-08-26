@@ -99,9 +99,16 @@ for i, (fname, op, backend, precision, note) in enumerate(CASES, 1):
         verdict = "ADMITTED" if p.admitted else "rejected"
         detail = row["roofline"][:78] if p.admitted else ",".join(row["failures"])
     except Exception as exc:
-        row.update(admitted=False, error=f"{type(exc).__name__}: {exc}"[:600],
-                   trace=traceback.format_exc()[-600:])
-        verdict, detail = "ERROR", row["error"][:78]
+        message = f"{type(exc).__name__}: {exc}"
+        row.update(admitted=False, error=message[:600], trace=traceback.format_exc()[-600:])
+        # A candidate that cannot produce a measurement at all has been rejected,
+        # not errored. That is the intended fate of a forgery: the supervisor is the
+        # only writer, so a worker that exits early leaves nothing behind.
+        if "without reporting a measurement" in message or "wrote no measurement" in message:
+            row["rejected_before_gates"] = True
+            verdict, detail = "rejected", "no measurement produced"
+        else:
+            verdict, detail = "ERROR", message[:78]
     row["elapsed_s"] = round(time.time() - started, 1)
     results.append(row)
     print(f"[{i:2d}/{len(CASES)}] {backend:9s} {precision:5s} {op:10s} {fname:32s} "
@@ -110,5 +117,8 @@ for i, (fname, op, backend, precision, note) in enumerate(CASES, 1):
 
 admitted = sum(1 for x in results if x.get("admitted"))
 cheats = [x for x in results if x["file"].startswith("cheat_")]
+errors = [x for x in results if x.get("error") and not x.get("rejected_before_gates")]
 print(f"\n{len(results)} cases: {admitted} admitted, {len(results) - admitted} not")
 print(f"adversarial: {sum(1 for x in cheats if not x.get('admitted'))}/{len(cheats)} rejected")
+if errors:
+    print(f"unexpected errors: {', '.join(x['file'] for x in errors)}")
