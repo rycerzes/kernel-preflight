@@ -1,0 +1,104 @@
+{
+  "task": "Write a vectorised RMSNorm kernel for sm_89, consult the cuda-kernels skill for guidance, submit it to preflight_kernel, and report the gate table.",
+  "trials_per_arm": 4,
+  "arms": {
+    "managed": {
+      "completion_rate": 1.0,
+      "admitted_rate": 1.0,
+      "median_total_tokens": 87311.0,
+      "median_input_tokens": 84198.0,
+      "median_wall_s": 65.20131607796066,
+      "trials": [
+        {
+          "arm": "managed",
+          "completed": true,
+          "admitted": true,
+          "total_tokens": 111843,
+          "input_tokens": 107880,
+          "output_tokens": 3963,
+          "wall_s": 80.24420515983365,
+          "failure": null
+        },
+        {
+          "arm": "managed",
+          "completed": true,
+          "admitted": true,
+          "total_tokens": 53598,
+          "input_tokens": 50961,
+          "output_tokens": 2637,
+          "wall_s": 50.13644914701581,
+          "failure": null
+        },
+        {
+          "arm": "managed",
+          "completed": true,
+          "admitted": true,
+          "total_tokens": 74889,
+          "input_tokens": 72396,
+          "output_tokens": 2493,
+          "wall_s": 55.1682340670377,
+          "failure": null
+        },
+        {
+          "arm": "managed",
+          "completed": true,
+          "admitted": true,
+          "total_tokens": 99733,
+          "input_tokens": 96000,
+          "output_tokens": 3733,
+          "wall_s": 75.23439808888361,
+          "failure": null
+        }
+      ]
+    },
+    "raw": {
+      "completion_rate": 1.0,
+      "admitted_rate": 1.0,
+      "median_total_tokens": 58503.5,
+      "median_input_tokens": 56219.0,
+      "median_wall_s": 55.16368251910899,
+      "trials": [
+        {
+          "arm": "raw",
+          "completed": true,
+          "admitted": true,
+          "total_tokens": 57603,
+          "input_tokens": 54896,
+          "output_tokens": 2707,
+          "wall_s": 55.17239354015328,
+          "failure": null
+        },
+        {
+          "arm": "raw",
+          "completed": true,
+          "admitted": true,
+          "total_tokens": 58372,
+          "input_tokens": 56186,
+          "output_tokens": 2186,
+          "wall_s": 125.38932847091928,
+          "failure": null
+        },
+        {
+          "arm": "raw",
+          "completed": true,
+          "admitted": true,
+          "total_tokens": 58635,
+          "input_tokens": 56252,
+          "output_tokens": 2383,
+          "wall_s": 50.153297582874075,
+          "failure": null
+        },
+        {
+          "arm": "raw",
+          "completed": true,
+          "admitted": true,
+          "total_tokens": 68540,
+          "input_tokens": 66137,
+          "output_tokens": 2403,
+          "wall_s": 55.1549714980647,
+          "failure": null
+        }
+      ]
+    }
+  }
+}
