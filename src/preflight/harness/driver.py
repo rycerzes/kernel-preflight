@@ -45,12 +45,22 @@ import torch
 # ---------------------------------------------------------------------------
 
 
-def make_input(shape: tuple[int, ...], seed: int, device: torch.device) -> torch.Tensor:
+def make_input(
+    shape: tuple[int, ...], seed: int, device: torch.device, *, exponent_range: int = 6
+) -> torch.Tensor:
     """Values spanning several orders of magnitude, both signs.
 
     Not a narrow uniform: kernels have been observed exploiting inputs drawn from
     a tight range, and a softmax that skips its max subtraction looks correct on
     small values and overflows on large ones.
+
+    `exponent_range` bounds that spread, and some ops must bound it. Attention
+    computes a softmax over QK^T, so with `exponent_range=6` the scores span
+    roughly 2^24 and fp32 and fp64 disagree in the saturated tail by far more than
+    any sane tolerance -- the harness would fail correct kernels. Attention
+    therefore uses a realistic Q/K/V scale, and its protection against
+    narrow-range exploits comes from the score distribution rather than from the
+    input magnitudes.
     """
     gen = torch.Generator(device=device).manual_seed(seed)
     unit = torch.rand(shape, generator=gen, device=device, dtype=torch.float32)
@@ -59,7 +69,11 @@ def make_input(shape: tuple[int, ...], seed: int, device: torch.device) -> torch
         torch.tensor(-1.0, device=device),
         torch.tensor(1.0, device=device),
     )
-    exponent = torch.randint(-6, 7, shape, generator=gen, device=device, dtype=torch.float32)
+    if exponent_range <= 0:
+        return (sign * (0.25 + unit)).contiguous()
+    exponent = torch.randint(
+        -exponent_range, exponent_range + 1, shape, generator=gen, device=device, dtype=torch.float32
+    )
     return (sign * (0.25 + unit) * torch.pow(torch.tensor(2.0, device=device), exponent)).contiguous()
 
 
@@ -184,9 +198,11 @@ def _attention(seq: int, head_dim: int, seed: int, dev: torch.device) -> Problem
     """
     batch, heads = 4, 8
     shape = (batch, heads, seq, head_dim)
-    q = make_input(shape, seed, dev)
-    k = make_input(shape, seed ^ 0xA11, dev)
-    v = make_input(shape, seed ^ 0xB22, dev)
+    # Bounded magnitudes: see make_input. Wide-exponent Q/K would make the
+    # softmax saturate differently in fp32 and fp64 and fail correct kernels.
+    q = make_input(shape, seed, dev, exponent_range=0)
+    k = make_input(shape, seed ^ 0xA11, dev, exponent_range=0)
+    v = make_input(shape, seed ^ 0xB22, dev, exponent_range=0)
     ref = torch.nn.functional.scaled_dot_product_attention(q.double(), k.double(), v.double())
     elements = batch * heads * seq * head_dim
     # QK^T and PV are each 2*b*h*s*s*d; the softmax is negligible beside them.
@@ -253,7 +269,9 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
     # hardcodes, or ignores its arguments.
     key = next(iter(problem.inputs))
     original = problem.inputs[key].clone()
-    problem.inputs[key].copy_(make_input(tuple(original.shape), 0xA5A5A5, original.device))
+    problem.inputs[key].copy_(
+        make_input(tuple(original.shape), 0xA5A5A5, original.device, exponent_range=0)
+    )
     launch(problem.inputs, out, problem.meta)
     torch.cuda.synchronize()
     second = float(out.double()[torch.isfinite(out.double())].sum().item())

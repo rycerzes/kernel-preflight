@@ -10,13 +10,24 @@ FROM kernel-preflight-sandbox:cuda13
 # cu130 to match the driver on the host. Versions are pinned: an unpinned torch
 # would silently change the reference implementation that every verdict is
 # measured against.
+# Triton JIT-compiles a small C extension (cuda_utils.c) on first use and needs
+# Python headers to do it. Without python3-dev every Triton candidate fails with
+# "Python.h: No such file or directory" at run time rather than build time.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3-dev build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
 RUN pip3 install --no-cache-dir --break-system-packages \
       --index-url https://download.pytorch.org/whl/cu130 \
       torch==2.12.0
 
 # Helion 1.4.0, released 2026-07-29 — past the 7-day release-age floor. It
 # compiles to Triton, which ships inside the torch wheel.
-RUN pip3 install --no-cache-dir --break-system-packages helion==1.4.0
+#
+# `packaging` is imported at runtime by this stack but declared by none of it, so
+# the slim base image leaves it missing. The verification step below is what
+# surfaced that rather than a preflight run failing later.
+RUN pip3 install --no-cache-dir --break-system-packages helion==1.4.0 packaging setuptools
 
 # Fail the build rather than a preflight run if the stack is not importable.
 RUN python3 -c "\

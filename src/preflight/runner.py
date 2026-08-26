@@ -22,6 +22,7 @@ account for wall-clock time it never spent, and that inequality is checked.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import shutil
 import subprocess
@@ -124,6 +125,24 @@ def _run_in_container(
         "/work",
         "-v",
         f"{workdir}:/work",
+        # Run as the invoking user, not root. Otherwise every artefact the
+        # container writes into the bind mount (Python bytecode, Triton's JIT
+        # cache) is root-owned and the host cannot clean up its own temp
+        # directory. Dropping root is also simply correct for code we did not
+        # write.
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
+        # A non-root user has no home in the image, and both Triton and torch
+        # want somewhere to cache. Point them inside the bind mount so the
+        # artefacts are owned correctly and vanish with the temp directory.
+        "--env",
+        "HOME=/work",
+        "--env",
+        "TRITON_CACHE_DIR=/work/.triton",
+        "--env",
+        "TORCHINDUCTOR_CACHE_DIR=/work/.inductor",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
     ]
     if gpus:
         docker_args += ["--gpus", gpus]
