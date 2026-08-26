@@ -48,6 +48,7 @@ CASES = [
     ("cheat_forge_proc.cu",           "rmsnorm",   "cuda",     "fp32", "forges a verdict from /proc/self/cmdline"),
     ("cheat_python_noop.py",          "rmsnorm",   "torch",    "fp32", "writes nothing"),
     ("cheat_python_forge.py",         "rmsnorm",   "torch",    "fp32", "forges a verdict from sys.argv at import"),
+    ("cheat_timed_nan.py",            "rmsnorm",   "torch",    "fp32", "one true value and NaNs, only while timed"),
     ("cheat_silent_bf16.py",          "attention", "torch",    "fp32", "computes in bf16 while declaring fp32"),
     # Last on purpose: autotuning runs for minutes and leaves the GPU hot.
     ("helion_rmsnorm.py",             "rmsnorm",   "helion",   "fp32", "Helion (autotuned)"),
