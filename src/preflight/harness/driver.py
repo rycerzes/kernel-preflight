@@ -82,6 +82,20 @@ def make_input(
 # ---------------------------------------------------------------------------
 
 
+FP32_EPS = 1.1920929e-07
+
+
+def accumulation_tolerance(depth: int, safety: float = 8.0) -> float:
+    """Relative tolerance for an fp32 result accumulated over `depth` terms.
+
+    A single global tolerance is wrong because ops differ in conditioning. Summing
+    `depth` products in fp32 accumulates roughly sqrt(depth) * eps of relative
+    error under random signs, so a 4096-deep GEMM cannot be held to the same bar
+    as an elementwise SiLU. `safety` covers the conditioning the model does not.
+    """
+    return safety * math.sqrt(max(1, depth)) * FP32_EPS
+
+
 @dataclass(frozen=True)
 class Problem:
     """One concrete instance of an op: its tensors, cost model and reference."""
@@ -94,6 +108,7 @@ class Problem:
     bytes_moved: float
     flops: float
     working_set_bytes: float
+    rel_tol: float
 
 
 def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
@@ -112,6 +127,7 @@ def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
         bytes_moved=2.0 * n * 4,
         flops=4.0 * n,
         working_set_bytes=2.0 * n * 4,
+        rel_tol=accumulation_tolerance(cols),
     )
 
 
@@ -128,6 +144,7 @@ def _softmax(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
         bytes_moved=2.0 * n * 4,
         flops=5.0 * n,
         working_set_bytes=2.0 * n * 4,
+        rel_tol=accumulation_tolerance(cols),
     )
 
 
@@ -145,6 +162,7 @@ def _silu(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
         bytes_moved=2.0 * n * 4,
         flops=4.0 * n,
         working_set_bytes=2.0 * n * 4,
+        rel_tol=accumulation_tolerance(1),
     )
 
 
@@ -160,6 +178,8 @@ def _transpose(rows: int, cols: int, seed: int, dev: torch.device) -> Problem:
         reference=ref,
         bytes_moved=2.0 * n * 4,
         flops=0.0,
+        # Pure data movement: bit-exact, so no accumulation allowance.
+        rel_tol=0.0,
         working_set_bytes=2.0 * n * 4,
     )
 
@@ -173,8 +193,10 @@ def _matmul(m: int, k: int, seed: int, dev: torch.device) -> Problem:
     compute branch.
     """
     n = k
-    a = make_input((m, k), seed, dev)
-    b = make_input((k, n), seed ^ 0xB00, dev)
+    # Bounded magnitudes: a 4096-deep dot product over values spanning 2^12 loses
+    # more precision to cancellation than any tolerance should forgive.
+    a = make_input((m, k), seed, dev, exponent_range=0)
+    b = make_input((k, n), seed ^ 0xB00, dev, exponent_range=0)
     ref = a.double() @ b.double()
     return Problem(
         label=f"{m}x{k}x{n}",
@@ -185,6 +207,7 @@ def _matmul(m: int, k: int, seed: int, dev: torch.device) -> Problem:
         bytes_moved=float((m * k + k * n + m * n) * 4),
         flops=2.0 * m * k * n,
         working_set_bytes=float((m * k + k * n + m * n) * 4),
+        rel_tol=accumulation_tolerance(k),
     )
 
 
@@ -216,6 +239,8 @@ def _attention(seq: int, head_dim: int, seed: int, dev: torch.device) -> Problem
         bytes_moved=float(4 * elements * 4),  # q, k, v read; o written
         flops=flops,
         working_set_bytes=float(4 * elements * 4),
+        # Two chained accumulations of depth seq: QK^T then PV.
+        rel_tol=accumulation_tolerance(seq, safety=32.0),
     )
 
 
@@ -239,16 +264,46 @@ POISON = float("nan")
 MAX_REL_ERR_REPORTED = 0.0
 
 
-def deviation(got: torch.Tensor, want: torch.Tensor) -> tuple[float, float, bool]:
+def deviation(got: torch.Tensor, want: torch.Tensor, rel_tol: float) -> tuple[float, float, float, bool]:
+    """Compare against a mixed absolute/relative criterion.
+
+    Pure relative error is meaningless where the reference can be near zero. A
+    dot product of random values produces occasional near-zero results by
+    cancellation, and |1e-3 - 1e-5| / 1e-5 explodes even though the answer is
+    correct to four significant figures. Measured on this host: torch's *own*
+    matmul scores 2.8e-2 by pure relative error, and SDPA 3.6e-2 with TF32
+    disabled -- so that metric fails the reference implementations.
+
+    The criterion is the one `allclose` uses, with the absolute floor scaled to
+    the magnitude of the output rather than picked:
+
+        |got - want| <= rel_tol * (rms(|want|) + |want|)
+
+    `violation` is that inequality divided through, so 1.0 sits exactly on the
+    tolerance and the gate compares against a single dimensionless number.
+    """
     g = got.double()
     finite = torch.isfinite(g)
     has_nonfinite = bool((~finite).any().item())
+    if not bool(finite.any().item()):
+        return float("inf"), float("inf"), float("inf"), has_nonfinite
+
     diff = (g - want).abs()
     denom = want.abs()
-    max_abs = float(diff[finite].max().item()) if finite.any() else float("inf")
-    mask = finite & (denom > 1e-6)
-    max_rel = float((diff[mask] / denom[mask]).max().item()) if mask.any() else 0.0
-    return max_abs, max_rel, has_nonfinite
+    max_abs = float(diff[finite].max().item())
+
+    rel_mask = finite & (denom > 1e-6)
+    max_rel = float((diff[rel_mask] / denom[rel_mask]).max().item()) if bool(rel_mask.any().item()) else 0.0
+
+    if rel_tol <= 0.0:
+        # Bit-exact ops (pure data movement) get no allowance at all.
+        violation = 0.0 if max_abs == 0.0 else float("inf")
+        return max_abs, max_rel, violation, has_nonfinite
+
+    scale = float(want.abs().pow(2).mean().sqrt().item())
+    allowed = rel_tol * (scale + denom)
+    violation = float((diff[finite] / allowed[finite]).max().item())
+    return max_abs, max_rel, violation, has_nonfinite
 
 
 def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[str, Any]:
@@ -262,7 +317,7 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
     torch.cuda.synchronize()
 
     wrote_output = bool(torch.isfinite(out).any().item())
-    max_abs, max_rel, has_nonfinite = deviation(out, problem.reference)
+    max_abs, max_rel, violation, has_nonfinite = deviation(out, problem.reference, problem.rel_tol)
     first = float(out.double()[torch.isfinite(out.double())].sum().item()) if wrote_output else 0.0
 
     # Change an input; the output must follow. Catches a kernel that caches,
@@ -305,7 +360,7 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
 
     # Revalidate what the last *measured* call produced.
     timed_written = bool(torch.isfinite(out).any().item())
-    _, timed_rel, _ = deviation(out, problem.reference)
+    _, timed_rel, timed_violation, _ = deviation(out, problem.reference, problem.rel_tol)
 
     ordered = sorted(samples)
     return {
@@ -318,12 +373,15 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
         "max_ms": ordered[-1],
         "max_abs_err": max_abs,
         "max_rel_err": max_rel,
+        "violation": violation,
         "has_nonfinite": has_nonfinite,
         "wrote_output": wrote_output,
         "input_sensitive": input_sensitive,
         "inner_iters": inner,
         "timed_output_written": timed_written,
         "timed_max_rel_err": timed_rel,
+        "timed_violation": timed_violation,
+        "rel_tol": problem.rel_tol,
         "bytes_moved": problem.bytes_moved,
         "flops": problem.flops,
         "working_set_bytes": problem.working_set_bytes,

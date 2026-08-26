@@ -122,6 +122,22 @@ void reference_transpose(const std::vector<float>& x, const std::vector<float>&,
 }
 
 using FlopFn = double (*)(int rows, int cols);
+using TolFn = double (*)(int rows, int cols);
+
+constexpr double FP32_EPS = 1.1920929e-07;
+
+// Relative tolerance for an fp32 result accumulated over `depth` terms. One
+// global tolerance is wrong: ops differ in conditioning, and summing `depth`
+// products in fp32 accumulates roughly sqrt(depth) * eps under random signs, so a
+// deep reduction cannot be held to the same bar as an elementwise map.
+double accumulation_tolerance(int depth, double safety = 8.0) {
+  return safety * std::sqrt(static_cast<double>(depth < 1 ? 1 : depth)) * FP32_EPS;
+}
+
+double tol_reduction(int, int cols) { return accumulation_tolerance(cols); }
+double tol_elementwise(int, int) { return accumulation_tolerance(1); }
+// Pure data movement is bit-exact; no accumulation allowance is warranted.
+double tol_exact(int, int) { return 0.0; }
 
 // Compulsory arithmetic per invocation. Only the order of magnitude matters: it
 // decides which ceiling binds, and a factor-of-two error in the FLOP count moves
@@ -138,14 +154,15 @@ struct OpSpec {
   const char* name;
   ReferenceFn reference;
   FlopFn flops;
+  TolFn tolerance;
   bool uses_weight;
 };
 
 constexpr OpSpec OPS[] = {
-    {"rmsnorm", &reference_rmsnorm, &flops_rmsnorm, true},
-    {"softmax", &reference_softmax, &flops_softmax, false},
-    {"silu", &reference_silu, &flops_silu, false},
-    {"transpose", &reference_transpose, &flops_transpose, false},
+    {"rmsnorm", &reference_rmsnorm, &flops_rmsnorm, &tol_reduction, true},
+    {"softmax", &reference_softmax, &flops_softmax, &tol_reduction, false},
+    {"silu", &reference_silu, &flops_silu, &tol_elementwise, false},
+    {"transpose", &reference_transpose, &flops_transpose, &tol_exact, false},
 };
 
 int fp32_lanes_per_sm(int major, int minor) {
@@ -169,11 +186,22 @@ const OpSpec* find_op(const char* name) {
 struct Deviation {
   double max_abs;
   double max_rel;
+  // |got - want| / (rel_tol * (rms|want| + |want|)). 1.0 sits exactly on the
+  // tolerance. Pure relative error is meaningless where the reference can be
+  // near zero: cancellation in a dot product yields occasional near-zero results
+  // and the ratio explodes even for a correct kernel. Measured on this host,
+  // pure relative error fails torch's own matmul at 2.8e-2.
+  double violation;
   bool has_nonfinite;
 };
 
-Deviation compare(const std::vector<float>& got, const std::vector<double>& want) {
-  Deviation d{0.0, 0.0, false};
+Deviation compare(const std::vector<float>& got, const std::vector<double>& want, double rel_tol) {
+  Deviation d{0.0, 0.0, 0.0, false};
+
+  double sum_sq = 0.0;
+  for (double w : want) sum_sq += w * w;
+  const double scale = want.empty() ? 0.0 : std::sqrt(sum_sq / static_cast<double>(want.size()));
+
   for (size_t i = 0; i < got.size(); ++i) {
     if (!std::isfinite(got[i])) {
       d.has_nonfinite = true;
@@ -185,6 +213,13 @@ Deviation compare(const std::vector<float>& got, const std::vector<double>& want
     if (denom > 1e-6) {
       double rel = diff / denom;
       d.max_rel = rel > d.max_rel ? rel : d.max_rel;
+    }
+    if (rel_tol <= 0.0) {
+      // Bit-exact op: any difference at all is a violation.
+      if (diff > 0.0) d.violation = std::numeric_limits<double>::infinity();
+    } else {
+      double v = diff / (rel_tol * (scale + denom));
+      d.violation = v > d.violation ? v : d.violation;
     }
   }
   return d;
@@ -210,12 +245,15 @@ struct ShapeResult {
   double max_ms;
   double max_abs_err;
   double max_rel_err;
+  double violation;
   bool has_nonfinite;
   bool wrote_output;      // output changed from the poison value
   bool input_sensitive;   // output changed when the input changed
   int inner_iters;            // launches batched into one timed sample
   bool timed_output_written;  // the measured calls wrote a result too
   double timed_max_rel_err;   // error of the last measured call
+  double timed_violation;
+  double rel_tol;
   double bytes_moved;
   double flops;
   double working_set_bytes;
@@ -256,7 +294,7 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
   std::vector<float> poison(count);
   std::memset(poison.data(), poison_byte, bytes);
   bool wrote_output = std::memcmp(h_y.data(), poison.data(), bytes) != 0;
-  Deviation dev = compare(h_y, h_ref);
+  Deviation dev = compare(h_y, h_ref, op.tolerance(rows, cols));
   double first_checksum = checksum(h_y);
 
   // Change the input and require the output to follow. Catches a kernel that
@@ -320,7 +358,7 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
   std::vector<float> h_y_timed(count);
   CUDA_CHECK(cudaMemcpy(h_y_timed.data(), d_y, bytes, cudaMemcpyDeviceToHost));
   bool timed_output_written = std::memcmp(h_y_timed.data(), poison.data(), bytes) != 0;
-  Deviation timed_dev = compare(h_y_timed, h_ref);
+  Deviation timed_dev = compare(h_y_timed, h_ref, op.tolerance(rows, cols));
 
   std::vector<double> sorted = samples;
   for (size_t i = 1; i < sorted.size(); ++i) {
@@ -349,15 +387,18 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
   r.max_ms = sorted.back();
   r.max_abs_err = dev.max_abs;
   r.max_rel_err = dev.max_rel;
+  r.violation = dev.violation;
   r.has_nonfinite = dev.has_nonfinite;
   r.wrote_output = wrote_output;
   r.input_sensitive = input_sensitive;
   r.inner_iters = inner;
   r.timed_output_written = timed_output_written;
   r.timed_max_rel_err = timed_dev.max_rel;
+  r.timed_violation = timed_dev.violation;
   // Compulsory traffic: read x once, write y once. The weight vector is cached.
   r.bytes_moved = 2.0 * static_cast<double>(bytes);
   r.flops = op.flops(rows, cols);
+  r.rel_tol = op.tolerance(rows, cols);
   // Input + output are both live across the kernel; the weight vector is negligible.
   r.working_set_bytes = 2.0 * static_cast<double>(bytes);
   return r;
@@ -422,15 +463,15 @@ int main(int argc, char** argv) {
   for (int i = 0; i < shape_count; ++i) {
     ShapeResult r = measure(*op, shapes[i][0], shapes[i][1], repeats, seed + static_cast<unsigned int>(i));
     std::printf("    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"p90_ms\": %.6f, \"max_ms\": %.6f, "
-                "\"max_abs_err\": %.6g, \"max_rel_err\": %.6g, \"has_nonfinite\": %s, "
+                "\"max_abs_err\": %.6g, \"max_rel_err\": %.6g, \"violation\": %.6g, \"has_nonfinite\": %s, "
                 "\"wrote_output\": %s, \"input_sensitive\": %s, "
-                "\"inner_iters\": %d, \"timed_output_written\": %s, \"timed_max_rel_err\": %.6g, "
-                "\"bytes_moved\": %.1f, \"flops\": %.1f, \"working_set_bytes\": %.1f}%s\n",
-                r.rows, r.cols, r.min_ms, r.median_ms, r.p90_ms, r.max_ms, r.max_abs_err, r.max_rel_err,
+                "\"inner_iters\": %d, \"timed_output_written\": %s, \"timed_max_rel_err\": %.6g, \"timed_violation\": %.6g, "
+                "\"rel_tol\": %.6g, \"bytes_moved\": %.1f, \"flops\": %.1f, \"working_set_bytes\": %.1f}%s\n",
+                r.rows, r.cols, r.min_ms, r.median_ms, r.p90_ms, r.max_ms, r.max_abs_err, r.max_rel_err, r.violation,
                 r.has_nonfinite ? "true" : "false", r.wrote_output ? "true" : "false",
                 r.input_sensitive ? "true" : "false",
-                r.inner_iters, r.timed_output_written ? "true" : "false", r.timed_max_rel_err,
-                r.bytes_moved, r.flops, r.working_set_bytes,
+                r.inner_iters, r.timed_output_written ? "true" : "false", r.timed_max_rel_err, r.timed_violation,
+                r.rel_tol, r.bytes_moved, r.flops, r.working_set_bytes,
                 i + 1 == shape_count ? "" : ",");
   }
   std::printf("  ],\n");

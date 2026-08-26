@@ -3,6 +3,9 @@
 The first compute-bound candidate in the suite: arithmetic intensity is ~n/6, far
 above the RTX 4090's ~82 FLOP/byte ridge, so the FP32 pipelines bind rather than
 the memory bus. This is what actually exercises the roofline gate's compute branch.
+
+Pinned to IEEE fp32 so it is comparable to the harness's fp64 reference at an
+fp32 tolerance.
 """
 
 import triton
@@ -24,7 +27,12 @@ def _matmul(a_ptr, b_ptr, c_ptr, M, N, K,
                     mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
         b = tl.load(b_ptr + offs_k[:, None] * N + offs_n[None, :],
                     mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
-        acc += tl.dot(a, b)
+        # input_precision="ieee" forces true fp32 multiplies. Triton's default
+        # routes tl.dot through TF32 tensor cores, whose 10-bit mantissa gives
+        # ~5e-3 relative error — a legitimate speed/accuracy trade, but a
+        # different numerical contract than the caller asked for. See
+        # triton_matmul_tf32.py, which takes the default and is rejected for it.
+        acc += tl.dot(a, b, input_precision="ieee")
 
     tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc,
              mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
