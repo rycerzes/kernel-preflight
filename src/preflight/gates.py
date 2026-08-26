@@ -48,9 +48,11 @@ class GateResult:
 # fp32 accumulation over a few thousand elements; the reference is computed in
 # double, so this bounds the candidate's error rather than the reference's.
 MAX_REL_ERR = 2e-5
-# Ratio of slowest to fastest repeat. Wider than this and the median is not a
-# measurement, it is a mood.
-MAX_TIMING_SPREAD = 3.0
+# Ratio of the 90th percentile to the median. Deliberately not max/min: the first
+# timed call carries lazy module load and context setup, so a single cold outlier
+# would otherwise invalidate a perfectly stable run -- an honest baseline measured
+# min 0.010 ms, median 0.011 ms, max 1.178 ms, i.e. 119x on max/min and 1.05x here.
+MAX_TIMING_SPREAD = 2.0
 # See sol.roofline: a trivial float4 copy reaches ~91% of peak on this class of
 # part, so a kernel doing real arithmetic above 95% indicates the harness, not
 # the kernel.
@@ -112,22 +114,22 @@ def check_variance(measurement: dict[str, Any]) -> GateResult:
     worst_ratio = 0.0
     worst_shape = ""
     for shape in measurement["shapes"]:
-        if shape["min_ms"] <= 0:
+        if shape["median_ms"] <= 0:
             return GateResult("variance", GateStatus.FAIL, f"{_shape_label(shape)} reported a non-positive time")
-        ratio = shape["max_ms"] / shape["min_ms"]
+        ratio = shape["p90_ms"] / shape["median_ms"]
         if ratio > worst_ratio:
             worst_ratio, worst_shape = ratio, _shape_label(shape)
     if worst_ratio > MAX_TIMING_SPREAD:
         return GateResult(
             "variance",
             GateStatus.FAIL,
-            f"slowest repeat is {worst_ratio:.1f}x the fastest at {worst_shape}; "
-            f"timing is too unstable to support a claim",
+            f"p90 is {worst_ratio:.1f}x the median at {worst_shape}; the timing is too "
+            f"unstable for the median to support a claim",
         )
     return GateResult(
         "variance",
         GateStatus.PASS,
-        f"worst spread {worst_ratio:.2f}x over {measurement['repeats']} repeats",
+        f"worst p90/median {worst_ratio:.2f}x over {measurement['repeats']} repeats",
     )
 
 
@@ -204,8 +206,94 @@ def check_roofline(measurement: dict[str, Any]) -> GateResult:
     )
 
 
+def check_provenance(measurement: dict[str, Any]) -> GateResult:
+    """Did this measurement come from a run we started, in time we observed?
+
+    The harness prints its result, but the candidate is linked into the same
+    binary and C++ static constructors run before `main`. A candidate can print a
+    fabricated measurement and exit successfully before the harness runs -- an
+    empty kernel was admitted at a plausible 91% of peak that way.
+
+    Two facts the candidate cannot manufacture: a nonce chosen after its source
+    was fixed, and wall-clock time it never spent.
+    """
+    prov = measurement.get("_provenance")
+    if not prov:
+        return GateResult("provenance", GateStatus.FAIL, "no provenance recorded for this measurement")
+
+    if measurement.get("nonce") != prov["expected_nonce"]:
+        return GateResult(
+            "provenance",
+            GateStatus.FAIL,
+            "harness did not echo the run nonce; this output did not come from the run we started",
+        )
+
+    claimed_ms = measurement.get("harness_wall_ms")
+    if claimed_ms is None:
+        return GateResult(
+            "provenance",
+            GateStatus.FAIL,
+            "harness reported no wall time; it did not reach the end of its own run",
+        )
+
+    observed_ms = prov["observed_wall_s"] * 1000.0
+    if claimed_ms > observed_ms:
+        return GateResult(
+            "provenance",
+            GateStatus.FAIL,
+            f"harness claims {claimed_ms:.0f} ms of work but the process only ran for "
+            f"{observed_ms:.0f} ms — it cannot have spent time that did not elapse",
+        )
+
+    # Internal consistency: the timed loops alone cannot exceed the whole run.
+    timed_ms = sum(s["median_ms"] for s in measurement["shapes"]) * prov["repeats"]
+    if timed_ms > claimed_ms:
+        return GateResult(
+            "provenance",
+            GateStatus.FAIL,
+            f"timed loops sum to {timed_ms:.0f} ms inside a {claimed_ms:.0f} ms run",
+        )
+
+    return GateResult(
+        "provenance",
+        GateStatus.PASS,
+        f"nonce echoed; {claimed_ms:.0f} ms of work inside a {observed_ms:.0f} ms process",
+    )
+
+
+def check_timed_work(measurement: dict[str, Any]) -> GateResult:
+    """Did the *measured* calls do the work, or only the warmup?
+
+    Correctness is established before timing. Without this, a candidate can count
+    invocations, compute honestly through warmup and the sensitivity probe, then
+    skip the work during every timed call while keeping its passing correctness
+    fields.
+    """
+    for shape in measurement["shapes"]:
+        label = _shape_label(shape)
+        if not shape.get("timed_output_written", False):
+            return GateResult(
+                "timed_work",
+                GateStatus.FAIL,
+                f"the measured calls at {label} wrote nothing; only the warmup did work",
+            )
+        err = shape.get("timed_max_rel_err")
+        if err is None:
+            return GateResult("timed_work", GateStatus.FAIL, f"{label} reported no post-timing error")
+        if err > MAX_REL_ERR:
+            return GateResult(
+                "timed_work",
+                GateStatus.FAIL,
+                f"output after timing is wrong at {label} (rel err {err:.3g}); the measured "
+                f"calls did not do the same work as the warmup",
+            )
+    return GateResult("timed_work", GateStatus.PASS, "the measured calls produced correct output")
+
+
 ALL_GATES = (
+    check_provenance,
     check_correctness,
+    check_timed_work,
     check_liveness,
     check_input_sensitivity,
     check_shape_consistency,
@@ -239,13 +327,57 @@ class Preflight:
         }
 
 
+# Every field a gate dereferences. The measurement is attacker-influenced — a
+# candidate can print whatever it likes before the harness runs — so its shape is
+# checked before any gate touches it.
+REQUIRED_TOP_LEVEL = ("shapes", "peak_bandwidth_bytes_per_s", "repeats")
+REQUIRED_PER_SHAPE = (
+    "rows", "cols", "min_ms", "median_ms", "p90_ms", "max_ms",
+    "max_abs_err", "max_rel_err", "has_nonfinite", "wrote_output",
+    "input_sensitive", "timed_output_written", "timed_max_rel_err",
+    "bytes_moved", "working_set_bytes",
+)
+
+
+def check_wellformed(measurement: dict[str, Any]) -> GateResult:
+    """Reject a malformed measurement instead of crashing on it.
+
+    A forged result is unlikely to reproduce the harness's schema exactly, and an
+    incomplete one must be a verdict rather than an unhandled exception in the
+    server that asked for it.
+    """
+    missing = [f for f in REQUIRED_TOP_LEVEL if f not in measurement]
+    if missing:
+        return GateResult("wellformed", GateStatus.FAIL, f"measurement is missing {', '.join(missing)}")
+    shapes = measurement.get("shapes")
+    if not isinstance(shapes, list) or not shapes:
+        return GateResult("wellformed", GateStatus.FAIL, "measurement reports no shapes")
+    for index, shape in enumerate(shapes):
+        if not isinstance(shape, dict):
+            return GateResult("wellformed", GateStatus.FAIL, f"shape {index} is not an object")
+        absent = [f for f in REQUIRED_PER_SHAPE if f not in shape]
+        if absent:
+            return GateResult(
+                "wellformed",
+                GateStatus.FAIL,
+                f"shape {index} is missing {', '.join(absent)}; this did not come from the harness",
+            )
+    return GateResult("wellformed", GateStatus.PASS, f"{len(shapes)} shapes with every expected field")
+
+
 def run_gates(measurement: dict[str, Any]) -> Preflight:
     """Apply every gate. A kernel is admitted only if none fail.
 
     NOT_APPLICABLE never admits on its own -- it records that a gate could not
     bound this measurement, which is different from the measurement being sound.
     """
-    results = tuple(gate(measurement) for gate in ALL_GATES)
+    # Shape first. Later gates index into the measurement directly, and a
+    # malformed one must not reach them.
+    shape_ok = check_wellformed(measurement)
+    if shape_ok.blocking:
+        return Preflight(admitted=False, gates=(shape_ok,), measurement=measurement)
+
+    results = (shape_ok, *(gate(measurement) for gate in ALL_GATES))
     return Preflight(
         admitted=not any(r.blocking for r in results),
         gates=results,

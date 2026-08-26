@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <chrono>
 #include <cuda_runtime.h>
 
 extern "C" void launch_candidate(const float* x, const float* w, float* y, int rows, int cols, float eps,
@@ -113,12 +114,15 @@ struct ShapeResult {
   int cols;
   double min_ms;
   double median_ms;
+  double p90_ms;
   double max_ms;
   double max_abs_err;
   double max_rel_err;
   bool has_nonfinite;
   bool wrote_output;      // output changed from the poison value
   bool input_sensitive;   // output changed when the input changed
+  bool timed_output_written;  // the measured calls wrote a result too
+  double timed_max_rel_err;   // error of the last measured call
   double bytes_moved;
   double working_set_bytes;
 };
@@ -150,7 +154,7 @@ ShapeResult measure(int rows, int cols, int repeats, unsigned int seed) {
   reference_rmsnorm(h_x, h_w, h_ref, rows, cols, eps);
 
   // Warmup, outside the timed region.
-  for (int i = 0; i < 3; ++i) launch_candidate(d_x, d_w, d_y, rows, cols, eps, 0);
+  for (int i = 0; i < 10; ++i) launch_candidate(d_x, d_w, d_y, rows, cols, eps, 0);
   CUDA_CHECK(cudaDeviceSynchronize());
   CUDA_CHECK(cudaGetLastError());
 
@@ -181,21 +185,28 @@ ShapeResult measure(int rows, int cols, int repeats, unsigned int seed) {
   // is several percent and a lone number is not evidence.
   std::vector<double> samples;
   samples.reserve(static_cast<size_t>(repeats));
-  cudaEvent_t start, stop;
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
+  // Wall clock around a device-wide sync, not events on stream 0. A candidate can
+  // enqueue its work on its own non-blocking stream, which events recorded on
+  // stream 0 would not bracket -- the work would land after the stop event and be
+  // omitted from the elapsed time entirely.
+  CUDA_CHECK(cudaMemset(d_y, poison_byte, bytes));
   for (int i = 0; i < repeats; ++i) {
-    CUDA_CHECK(cudaEventRecord(start));
+    auto t0 = std::chrono::steady_clock::now();
     launch_candidate(d_x, d_w, d_y, rows, cols, eps, 0);
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-    samples.push_back(static_cast<double>(ms));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto t1 = std::chrono::steady_clock::now();
+    samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
   }
   CUDA_CHECK(cudaGetLastError());
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
+
+  // Re-validate what the *last timed* call produced. Correctness was checked
+  // before timing; without this a candidate can count invocations, compute
+  // honestly through warmup and the sensitivity probe, then skip the work during
+  // every measured call and keep its passing correctness fields.
+  std::vector<float> h_y_timed(count);
+  CUDA_CHECK(cudaMemcpy(h_y_timed.data(), d_y, bytes, cudaMemcpyDeviceToHost));
+  bool timed_output_written = std::memcmp(h_y_timed.data(), poison.data(), bytes) != 0;
+  Deviation timed_dev = compare(h_y_timed, h_ref);
 
   std::vector<double> sorted = samples;
   for (size_t i = 1; i < sorted.size(); ++i) {
@@ -214,12 +225,15 @@ ShapeResult measure(int rows, int cols, int repeats, unsigned int seed) {
   r.cols = cols;
   r.min_ms = sorted.front();
   r.median_ms = sorted[sorted.size() / 2];
+  r.p90_ms = sorted[(sorted.size() * 9) / 10];
   r.max_ms = sorted.back();
   r.max_abs_err = dev.max_abs;
   r.max_rel_err = dev.max_rel;
   r.has_nonfinite = dev.has_nonfinite;
   r.wrote_output = wrote_output;
   r.input_sensitive = input_sensitive;
+  r.timed_output_written = timed_output_written;
+  r.timed_max_rel_err = timed_dev.max_rel;
   // Compulsory traffic: read x once, write y once. The weight vector is cached.
   r.bytes_moved = 2.0 * static_cast<double>(bytes);
   // Input + output are both live across the kernel; the weight vector is negligible.
@@ -230,8 +244,12 @@ ShapeResult measure(int rows, int cols, int repeats, unsigned int seed) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  auto harness_start = std::chrono::steady_clock::now();
   int repeats = argc > 1 ? std::atoi(argv[1]) : 30;
   unsigned int seed = argc > 2 ? static_cast<unsigned int>(std::strtoul(argv[2], nullptr, 10)) : 20260826u;
+  // Echoed back so the caller can tell this output came from a run it started,
+  // rather than from anything the candidate printed on its way past.
+  const char* nonce = argc > 3 ? argv[3] : "";
   if (repeats < 5) repeats = 5;
 
   // Several shapes, so specialising to one is visible as failure on the others.
@@ -248,6 +266,7 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaGetDeviceProperties(&props, 0));
 
   std::printf("{\n");
+  std::printf("  \"nonce\": \"%s\",\n", nonce);
   std::printf("  \"device\": \"%s\",\n", props.name);
   std::printf("  \"compute_capability\": \"%d.%d\",\n", props.major, props.minor);
   std::printf("  \"peak_bandwidth_bytes_per_s\": %.1f,\n",
@@ -261,15 +280,24 @@ int main(int argc, char** argv) {
   std::printf("  \"shapes\": [\n");
   for (int i = 0; i < shape_count; ++i) {
     ShapeResult r = measure(shapes[i][0], shapes[i][1], repeats, seed + static_cast<unsigned int>(i));
-    std::printf("    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"max_ms\": %.6f, "
+    std::printf("    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"p90_ms\": %.6f, \"max_ms\": %.6f, "
                 "\"max_abs_err\": %.6g, \"max_rel_err\": %.6g, \"has_nonfinite\": %s, "
-                "\"wrote_output\": %s, \"input_sensitive\": %s, \"bytes_moved\": %.1f, "
-                "\"working_set_bytes\": %.1f}%s\n",
-                r.rows, r.cols, r.min_ms, r.median_ms, r.max_ms, r.max_abs_err, r.max_rel_err,
+                "\"wrote_output\": %s, \"input_sensitive\": %s, "
+                "\"timed_output_written\": %s, \"timed_max_rel_err\": %.6g, "
+                "\"bytes_moved\": %.1f, \"working_set_bytes\": %.1f}%s\n",
+                r.rows, r.cols, r.min_ms, r.median_ms, r.p90_ms, r.max_ms, r.max_abs_err, r.max_rel_err,
                 r.has_nonfinite ? "true" : "false", r.wrote_output ? "true" : "false",
-                r.input_sensitive ? "true" : "false", r.bytes_moved, r.working_set_bytes,
+                r.input_sensitive ? "true" : "false",
+                r.timed_output_written ? "true" : "false", r.timed_max_rel_err,
+                r.bytes_moved, r.working_set_bytes,
                 i + 1 == shape_count ? "" : ",");
   }
-  std::printf("  ]\n}\n");
+  std::printf("  ],\n");
+  // Self-reported wall time. The caller compares this against the elapsed
+  // time it measured for the whole process; a forged result printed before
+  // any work happened cannot account for time it never spent.
+  std::printf("  \"harness_wall_ms\": %.3f\n}\n",
+              std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - harness_start).count());
   return 0;
 }

@@ -24,7 +24,7 @@ from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from preflight.device import CudaDriverError, probe
-from preflight.runner import CompileError, HarnessError, preflight_source
+from preflight.runner import CompileError, HarnessError, IsolationError, preflight_source
 
 server = MCPServer(
     name="kernel-preflight",
@@ -65,9 +65,13 @@ def preflight_kernel(
     try:
         report = preflight_source(candidate_source, arch=arch, repeats=repeats)
     except CompileError as exc:
+        # Timeouts are folded into these by the runner, so a slow compile or a
+        # hanging candidate is a rejected verdict rather than a server error.
         return {"admitted": False, "stage": "compile", "error": str(exc)[:4000]}
     except HarnessError as exc:
         return {"admitted": False, "stage": "measure", "error": str(exc)[:4000]}
+    except IsolationError as exc:
+        return {"admitted": False, "stage": "isolation", "error": str(exc)[:4000]}
     payload = report.to_dict()
     payload["stage"] = "gates"
     payload["summary"] = report.preflight.summary()
@@ -92,7 +96,7 @@ def publish_kernel(
     # is a claim.
     try:
         report = preflight_source(candidate_source)
-    except (CompileError, HarnessError) as exc:
+    except (CompileError, HarnessError, IsolationError) as exc:
         return {"published": False, "reason": f"re-verification failed: {exc}"[:2000]}
     if not report.admitted:
         return {
