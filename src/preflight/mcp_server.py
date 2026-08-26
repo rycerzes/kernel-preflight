@@ -50,20 +50,26 @@ def device_spec() -> dict[str, Any]:
 @server.tool(
     annotations={"readOnlyHint": True},
     description=(
-        "Compile a candidate RMSNorm kernel against the fixed harness, measure it across "
+        "Compile a candidate kernel against the fixed harness, measure it across "
         "five shapes, and run every preflight gate. The candidate must define "
         'extern \"C\" void launch_candidate(const float* x, const float* w, float* y, '
         "int rows, int cols, float eps, cudaStream_t stream). Returns per-gate verdicts "
-        "and the raw measurement."
+        "and the raw measurement. Supported ops: rmsnorm (row reduction, uses w and eps), "
+        "softmax (row reduction, numerically delicate), silu (pure elementwise), "
+        "transpose (pure memory movement, y is cols x rows)."
     ),
 )
 def preflight_kernel(
     candidate_source: Annotated[str, Field(description="Full CUDA source defining launch_candidate.")],
+    op: Annotated[
+        str,
+        Field(description="Operation to measure: rmsnorm, softmax, silu or transpose."),
+    ] = "rmsnorm",
     arch: Annotated[str, Field(description="Target architecture, e.g. sm_89.")] = "sm_89",
     repeats: Annotated[int, Field(ge=5, le=200, description="Timed repeats per shape.")] = 30,
 ) -> dict[str, Any]:
     try:
-        report = preflight_source(candidate_source, arch=arch, repeats=repeats)
+        report = preflight_source(candidate_source, op=op, arch=arch, repeats=repeats)
     except CompileError as exc:
         # Timeouts are folded into these by the runner, so a slow compile or a
         # hanging candidate is a rejected verdict rather than a server error.

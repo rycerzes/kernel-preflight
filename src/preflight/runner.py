@@ -36,6 +36,10 @@ from preflight.gates import Preflight, run_gates
 HARNESS_DIR = Path(__file__).parent / "harness"
 DRIVER = HARNESS_DIR / "driver.cu"
 DEFAULT_ARCH = "sm_89"
+# Operations the harness can measure. Each supplies its own double-precision host
+# reference; the candidate signature is shared, and ops without a weight vector or
+# epsilon simply ignore those arguments.
+SUPPORTED_OPS = ("rmsnorm", "softmax", "silu", "transpose")
 DEFAULT_IMAGE = "kernel-preflight-sandbox:cuda13"
 COMPILE_TIMEOUT_S = 300
 RUN_TIMEOUT_S = 900
@@ -118,6 +122,7 @@ def _run_in_container(
 def preflight_source(
     candidate_source: str,
     *,
+    op: str = "rmsnorm",
     arch: str = DEFAULT_ARCH,
     repeats: int = 30,
     seed: int = 20260826,
@@ -129,6 +134,9 @@ def preflight_source(
     `candidate_source` must define
     `extern "C" void launch_candidate(const float*, const float*, float*, int, int, float, cudaStream_t)`.
     """
+    if op not in SUPPORTED_OPS:
+        raise CompileError(f"unknown op {op!r}; supported: {', '.join(SUPPORTED_OPS)}")
+
     with tempfile.TemporaryDirectory(prefix="kernel-preflight-") as tmp:
         workdir = Path(tmp)
         # World-readable so the container user can read regardless of uid mapping.
@@ -162,7 +170,7 @@ def preflight_source(
             run_proc = _run_in_container(
                 workdir=workdir,
                 image=image,
-                argv=["./preflight", str(repeats), str(seed), nonce],
+                argv=["./preflight", op, str(repeats), str(seed), nonce],
                 timeout_s=RUN_TIMEOUT_S,
                 gpus=gpus,
             )

@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 #include <chrono>
 #include <cuda_runtime.h>
@@ -74,6 +75,72 @@ void reference_rmsnorm(const std::vector<float>& x, const std::vector<float>& w,
   }
 }
 
+using ReferenceFn = void (*)(const std::vector<float>&, const std::vector<float>&, std::vector<double>&, int, int,
+                             double);
+
+// Row-wise softmax with the standard max subtraction. Numerically the most
+// delicate of the set: a candidate that skips the max shift still looks correct
+// on small values and blows up on large ones, which is why the input
+// distribution spans several orders of magnitude.
+void reference_softmax(const std::vector<float>& x, const std::vector<float>&, std::vector<double>& y, int rows,
+                       int cols, double) {
+  for (int r = 0; r < rows; ++r) {
+    const float* row = x.data() + static_cast<size_t>(r) * cols;
+    double row_max = -std::numeric_limits<double>::infinity();
+    for (int c = 0; c < cols; ++c) row_max = row[c] > row_max ? row[c] : row_max;
+    double sum = 0.0;
+    for (int c = 0; c < cols; ++c) sum += std::exp(static_cast<double>(row[c]) - row_max);
+    for (int c = 0; c < cols; ++c) {
+      y[static_cast<size_t>(r) * cols + c] = std::exp(static_cast<double>(row[c]) - row_max) / sum;
+    }
+  }
+}
+
+// SiLU: x * sigmoid(x). Purely elementwise -- no reduction, no cross-thread
+// communication. Included because every other op in the set has a row reduction,
+// and a gate suite that only ever sees reductions is not known to generalise.
+void reference_silu(const std::vector<float>& x, const std::vector<float>&, std::vector<double>& y, int rows,
+                    int cols, double) {
+  const size_t n = static_cast<size_t>(rows) * cols;
+  for (size_t i = 0; i < n; ++i) {
+    double v = x[i];
+    y[i] = v / (1.0 + std::exp(-v));
+  }
+}
+
+// Transpose. No arithmetic at all, so it is the cleanest test of the roofline
+// gate: any time above the compulsory traffic is pure memory inefficiency. A
+// naive implementation writes uncoalesced and lands far below peak, which makes
+// it the one op in the set where the gate has real headroom to discriminate.
+void reference_transpose(const std::vector<float>& x, const std::vector<float>&, std::vector<double>& y, int rows,
+                         int cols, double) {
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < cols; ++c) {
+      y[static_cast<size_t>(c) * rows + r] = x[static_cast<size_t>(r) * cols + c];
+    }
+  }
+}
+
+struct OpSpec {
+  const char* name;
+  ReferenceFn reference;
+  bool uses_weight;
+};
+
+constexpr OpSpec OPS[] = {
+    {"rmsnorm", &reference_rmsnorm, true},
+    {"softmax", &reference_softmax, false},
+    {"silu", &reference_silu, false},
+    {"transpose", &reference_transpose, false},
+};
+
+const OpSpec* find_op(const char* name) {
+  for (const OpSpec& op : OPS) {
+    if (std::strcmp(op.name, name) == 0) return &op;
+  }
+  return nullptr;
+}
+
 struct Deviation {
   double max_abs;
   double max_rel;
@@ -127,7 +194,7 @@ struct ShapeResult {
   double working_set_bytes;
 };
 
-ShapeResult measure(int rows, int cols, int repeats, unsigned int seed) {
+ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned int seed) {
   const size_t count = static_cast<size_t>(rows) * cols;
   const size_t bytes = count * sizeof(float);
   const float eps = 1e-6f;
@@ -151,7 +218,7 @@ ShapeResult measure(int rows, int cols, int repeats, unsigned int seed) {
   const int poison_byte = 0x7F;
   CUDA_CHECK(cudaMemset(d_y, poison_byte, bytes));
 
-  reference_rmsnorm(h_x, h_w, h_ref, rows, cols, eps);
+  op.reference(h_x, h_w, h_ref, rows, cols, eps);
 
   // Warmup, outside the timed region.
   for (int i = 0; i < 10; ++i) launch_candidate(d_x, d_w, d_y, rows, cols, eps, 0);
@@ -245,11 +312,17 @@ ShapeResult measure(int rows, int cols, int repeats, unsigned int seed) {
 
 int main(int argc, char** argv) {
   auto harness_start = std::chrono::steady_clock::now();
-  int repeats = argc > 1 ? std::atoi(argv[1]) : 30;
-  unsigned int seed = argc > 2 ? static_cast<unsigned int>(std::strtoul(argv[2], nullptr, 10)) : 20260826u;
+  const char* op_name = argc > 1 ? argv[1] : "rmsnorm";
+  const OpSpec* op = find_op(op_name);
+  if (op == nullptr) {
+    std::printf("{\"error\":\"unknown op: %s\"}\n", op_name);
+    return 2;
+  }
+  int repeats = argc > 2 ? std::atoi(argv[2]) : 30;
+  unsigned int seed = argc > 3 ? static_cast<unsigned int>(std::strtoul(argv[3], nullptr, 10)) : 20260826u;
   // Echoed back so the caller can tell this output came from a run it started,
   // rather than from anything the candidate printed on its way past.
-  const char* nonce = argc > 3 ? argv[3] : "";
+  const char* nonce = argc > 4 ? argv[4] : "";
   if (repeats < 5) repeats = 5;
 
   // Several shapes, so specialising to one is visible as failure on the others.
@@ -267,6 +340,8 @@ int main(int argc, char** argv) {
 
   std::printf("{\n");
   std::printf("  \"nonce\": \"%s\",\n", nonce);
+  std::printf("  \"op\": \"%s\",\n", op->name);
+  std::printf("  \"op\": \"%s\",\n", op->name);
   std::printf("  \"device\": \"%s\",\n", props.name);
   std::printf("  \"compute_capability\": \"%d.%d\",\n", props.major, props.minor);
   std::printf("  \"peak_bandwidth_bytes_per_s\": %.1f,\n",
@@ -279,7 +354,7 @@ int main(int argc, char** argv) {
   std::printf("  \"seed\": %u,\n", seed);
   std::printf("  \"shapes\": [\n");
   for (int i = 0; i < shape_count; ++i) {
-    ShapeResult r = measure(shapes[i][0], shapes[i][1], repeats, seed + static_cast<unsigned int>(i));
+    ShapeResult r = measure(*op, shapes[i][0], shapes[i][1], repeats, seed + static_cast<unsigned int>(i));
     std::printf("    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"p90_ms\": %.6f, \"max_ms\": %.6f, "
                 "\"max_abs_err\": %.6g, \"max_rel_err\": %.6g, \"has_nonfinite\": %s, "
                 "\"wrote_output\": %s, \"input_sensitive\": %s, "
