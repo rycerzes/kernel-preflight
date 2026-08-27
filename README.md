@@ -92,11 +92,26 @@ The gates:
 | `roofline` | the implied throughput is physically impossible |
 
 The sandbox has to hold the GPU, because a performance claim measured somewhere
-other than where the kernel runs is not a measurement. TrueForge's existing
-bubblewrap-based local provider cannot do that — `bwrap` is not setuid, so it
-always unshares into a user namespace, and the NVIDIA driver refuses to initialise
-inside one. Full write-up, including the four configurations tried, in
+other than where the kernel runs is not a measurement. I built a container sandbox
+provider for that and contributed it upstream.
+
+**I got the reason wrong, and the correction is worth more than the original claim.**
+I reported that TrueForge's bubblewrap-based local provider *could not* reach a GPU,
+because `bwrap` is not setuid so it always unshares into a user namespace and the
+NVIDIA driver refuses to initialise there. That is false. A real CUDA kernel runs
+inside bwrap, in an unprivileged user namespace, at **920.1 GB/s against 920.7 GB/s
+on the host**. My original testing was missing a `/sys` bind, and needed the device
+nodes writable; every configuration I tried varied only `/dev`, so all of them failed
+and I blamed the namespace.
+
+That claim was published in an upstream issue and PR before I retested it. Both are
+[corrected in public](https://github.com/truefoundry/trueforge/issues/466#issuecomment-5434642663) rather than quietly edited, and I have told the
+maintainers I would rather they closed the PR than merged it on a premise I got wrong.
+The full investigation, including the probe table that settles it, is in
 [`docs/sandbox-gpu-investigation.md`](docs/sandbox-gpu-investigation.md).
+
+The irony is not lost: this is a project about not trusting a claim because the
+person making it is confident.
 
 ## Verified
 

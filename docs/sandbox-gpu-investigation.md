@@ -31,12 +31,16 @@ current instance on your own infrastructure.
 
 ## Attempt 1: teach the existing bubblewrap sandbox about the GPU
 
-This was the preferred outcome -- a small diff to an existing provider rather than a
-new one. `hostRun.ts` declares the Linux dependency set as `['bwrap', 'socat', 'rg']`,
-and the Linux read policy already allows `/dev`, `/usr/lib`, `/usr/local`, `/proc`
-and `/sys`. On paper the device nodes and driver libraries are already reachable.
+> **This section originally concluded that bubblewrap cannot reach a GPU. That
+> conclusion was wrong, it was published upstream before it was retested, and the
+> retest is below.** The wrong reasoning is kept rather than deleted, because the
+> way it was wrong is the useful part.
 
-They are reachable. The driver still refuses.
+`hostRun.ts` declares the Linux dependency set as `['bwrap', 'socat', 'rg']`, and the
+Linux read policy already allows `/dev`, `/usr/lib`, `/usr/local`, `/proc` and `/sys`.
+On paper the device nodes and driver libraries are already reachable.
+
+What I measured first:
 
 | bwrap configuration | `cuInit` result |
 | --- | --- |
@@ -45,23 +49,73 @@ They are reachable. The driver still refuses.
 | `--dev /dev` + explicit `--dev-bind` per `/dev/nvidia*` node | `CUDA_ERROR_OPERATING_SYSTEM` |
 | ...plus `/proc/driver/nvidia` rebound read-only | `CUDA_ERROR_OPERATING_SYSTEM` |
 
-The first row confirms the harness is otherwise working: hide the nodes and CUDA
-correctly reports no device. The rest show the nodes visible and initialisation
-blocked anyway.
+From which I concluded: *"The cause is the user namespace. `bwrap` is not setuid, so
+it always unshares into a new user namespace, and the NVIDIA kernel driver rejects
+initialisation from one. This is not a policy that can be relaxed with more bind
+mounts."*
 
-The cause is the user namespace. `/usr/bin/bwrap` is not setuid
-(`-rwxr-xr-x root root`), so it always unshares into a new user namespace, and the
-NVIDIA kernel driver rejects initialisation from one. This is not a policy that can
-be relaxed with more bind mounts; it is why `nvidia-container-toolkit` exists at all.
+**Every row of that table is missing `/sys`.** The four configurations vary only how
+`/dev` is handled, so they were four samples of one experiment. Four failures that
+agree tell you nothing if they share a cause you never varied — and a table that
+*looks* like a controlled sweep is more persuasive than a single failure, which is
+what made it convincing rather than suspicious.
 
-`nvidia-container-cli` is installed on this host and can inject a GPU into an
-existing namespace, which is how Podman and Singularity solve it. It needs
-`CAP_SYS_ADMIN`. A sandbox provider that requires root to start a sandbox is not a
-provider anyone should merge, so that route was rejected on design grounds rather
-than attempted.
+## The retest
 
-**Conclusion:** GPU support in the bubblewrap provider is a kernel/namespace research
-problem, not a configuration fix. Out of scope.
+Probing `cuInit` through `dlopen("libcuda.so.1")` so nothing depends on the CUDA
+toolkit. Every row runs under the same unprivileged user namespace:
+
+| bwrap configuration | `cuInit` |
+| --- | --- |
+| nvidia nodes `--dev-bind`, **no `/sys`** — the original test | `CUDA_ERROR_OPERATING_SYSTEM` (304) |
+| `--ro-bind /dev` + `/sys` | `CUDA_ERROR_NO_DEVICE` (100) |
+| `--dev-bind /dev` + `/sys` | **OK, devices=1** |
+| `--ro-bind /dev`, nvidia nodes `--dev-bind`, + `/sys` | **OK, devices=1** |
+
+And the same 256 MiB float4 copy kernel that the harness uses elsewhere:
+
+```
+host:          KERNEL OK  920.7 GB/s
+inside bwrap:  KERNEL OK  920.1 GB/s
+```
+
+The namespace is genuinely new and genuinely unprivileged — `/proc/self/ns/user`
+differs from the host's (`4026536407` against `4026531837`) and `/proc/self/uid_map`
+is `1000 1000 1`. `nvidia-smi` works inside it.
+
+So there are two requirements, and neither is about namespaces:
+
+1. **`/sys` must be mounted.** Without it, `CUDA_ERROR_OPERATING_SYSTEM`.
+2. **The nvidia device nodes must be writable.** A read-only `/dev` gives
+   `CUDA_ERROR_NO_DEVICE`; binding `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`
+   and `/dev/nvidia-uvm-tools` read-write is enough, so `/dev` itself can stay
+   read-only.
+
+This is exactly what `nvidia-container-toolkit` automates. It is not a capability the
+toolkit uniquely confers.
+
+### What it means for the local provider
+
+`ALLOW_READ_BY_PLATFORM.linux` already lists `/dev`, `/proc` and `/sys`, and
+`denySharedDefaultWritePaths()` deliberately keeps `/dev/*` out of the deny list. So
+the shipped local provider may already be close to GPU support, plausibly needing only
+that the nvidia nodes be writable.
+
+That is **not confirmed end to end.** Creating a local sandbox on this host pip-installs
+pydantic, and the corporate proxy blocks it, so the shipped provider could not be
+driven far enough to test. The mechanism result above is solid; the claim about the
+provider specifically is not, and is written here as a hypothesis rather than a finding.
+
+### Why this is in the repository
+
+The whole project argues that a confident claim from the party who benefits from it is
+not evidence. I made one, published it in an upstream issue and pull request, and was
+caught by a reader asking whether it was true. Both are corrected in public rather
+than edited quietly:
+[the correction](https://github.com/truefoundry/trueforge/issues/466#issuecomment-5434642663).
+
+The gates in this repository are built to catch a kernel that cannot be trusted about
+its own speed. Nothing in it was watching the author.
 
 ## Attempt 2: containers
 
@@ -79,20 +133,30 @@ for.
 
 ## Decision
 
-Implement a **container-backed sandbox provider**. It is more code than a bind-mount
-patch, but it has no unknown-unknowns, and it is the industry-standard answer to
-this exact problem.
+Implement a **container-backed sandbox provider**, and keep it — but for a different
+reason than the one it was chosen for.
 
-It also stands on its own merits regardless of GPUs. Requests for non-Daytona
+The original reasoning was that a container was the *only* way to get a GPU into a
+sandbox. That was wrong, per the retest above, so "more code than a bind-mount patch,
+but no unknown-unknowns" no longer justifies it: the bind-mount patch has no
+unknown-unknowns either, and is about two extra paths.
+
+What still justifies it has nothing to do with GPUs. Requests for non-Daytona
 sandbox backends exist upstream -- E2B ([#387](https://github.com/truefoundry/trueforge/issues/387),
 `help wanted`, open) and ComputeSDK
 ([#414](https://github.com/truefoundry/trueforge/issues/414), since closed) -- and
 now that Daytona cannot be self-hosted, a container provider is the only route to a
 fully self-hosted TrueForge.
 
-This landed upstream as
+This went upstream as
 [#466](https://github.com/truefoundry/trueforge/issues/466) (the analysis) and
-[#467](https://github.com/truefoundry/trueforge/pull/467) (the implementation).
+[#467](https://github.com/truefoundry/trueforge/pull/467) (the implementation), both
+now carrying the correction, and the PR retitled around self-hosting with GPU
+passthrough demoted to a bonus. The maintainers have been told that closing it is a
+perfectly good outcome.
+
+The better follow-up, if anyone wants it, is the two-line policy change to the local
+provider rather than this.
 
 `LocalSandboxProvider` is the reference to port from: same `SandboxProvider`
 interface, same path-shaped `sandboxId`, same file-transfer and traversal-validation
