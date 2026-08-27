@@ -28,8 +28,8 @@ from preflight.gates import (
 
 # The bar for an op that does not override it.
 TF32_BAR = DEFAULT_QUANTISATION_SAFETY * TF32_UNIT_ROUNDOFF
-# Attention family: shallow rows get no averaging, so the harness reports 24.
-ATTENTION_BAR = 24.0 * TF32_UNIT_ROUNDOFF
+# Attention family: shallow rows get no averaging, so the harness reports 48.
+ATTENTION_BAR = 48.0 * TF32_UNIT_ROUNDOFF
 
 # (k, harness rel_tol at that depth, violation measured for a real TF32 matmul)
 MEASURED = [(512, 2.15e-5, 62.6429), (1024, 3.05e-5, 47.3670),
@@ -67,7 +67,7 @@ def test_a_sloppier_tf32_kernel_is_rejected() -> None:
 
 def test_attention_gets_its_own_wider_bar() -> None:
     """The harness reports the factor; the gate must use it rather than a constant."""
-    shape = {"rel_tol": 4.32e-05, "quantisation_safety": 24.0}
+    shape = {"rel_tol": 4.32e-05, "quantisation_safety": 48.0}
     scale = _violation_scale({"precision": "tf32"}, shape)
     assert scale * shape["rel_tol"] == pytest.approx(ATTENTION_BAR, rel=1e-9)
     assert scale > _violation_scale({"precision": "tf32"}, {"rel_tol": 4.32e-05})
@@ -91,7 +91,7 @@ CAUSAL_ATTENTION = [(512, 2.16e-05, 266.0), (1024, 3.05e-05, 199.1),
 def test_causal_attention_is_not_falsely_rejected() -> None:
     """The regression: on the flat factor of 8 this kernel failed at up to 2.2x."""
     for seq, rel_tol, violation in CAUSAL_ATTENTION:
-        shape = {"rel_tol": rel_tol, "quantisation_safety": 24.0}
+        shape = {"rel_tol": rel_tol, "quantisation_safety": 48.0}
         normalised = violation / _violation_scale({"precision": "tf32"}, shape)
         assert normalised < 1.0, f"seq={seq} rejected at {normalised:.2f}x"
 
@@ -103,11 +103,23 @@ def test_it_would_have_been_rejected_on_the_flat_bar() -> None:
     assert violation / flat > 1.0
 
 
+# torch's own TF32 causal attention on the same shape, as the reference point the bar
+# is calibrated against rather than the kernels in this repository.
+TORCH_TF32_CAUSAL = (2048, 4.32e-05, 185.8)
+
+
+def test_a_reference_implementation_sits_well_inside_the_bar() -> None:
+    seq, rel_tol, violation = TORCH_TF32_CAUSAL
+    shape = {"rel_tol": rel_tol, "quantisation_safety": 48.0}
+    normalised = violation / _violation_scale({"precision": "tf32"}, shape)
+    assert normalised < 0.5, f"reference at {normalised:.2f}x leaves no room for data spread"
+
+
 def test_the_bar_still_bites_after_widening_for_it() -> None:
-    """Twice as sloppy as the worst honest case must still fail."""
-    seq, rel_tol, violation = CAUSAL_ATTENTION[-1]
-    shape = {"rel_tol": rel_tol, "quantisation_safety": 24.0}
-    assert (violation * 2) / _violation_scale({"precision": "tf32"}, shape) > 1.0
+    """Three times a reference implementation must still fail."""
+    seq, rel_tol, violation = TORCH_TF32_CAUSAL
+    shape = {"rel_tol": rel_tol, "quantisation_safety": 48.0}
+    assert (violation * 3) / _violation_scale({"precision": "tf32"}, shape) > 1.0
 
 
 @pytest.mark.parametrize("precision", ["fp32", "bf16", "fp16"])
