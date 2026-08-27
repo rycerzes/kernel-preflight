@@ -302,7 +302,7 @@ def preflight_source(
             # them and owns the write.
             run_argv = [
                 "python3", "supervisor.py", "--",
-                "./preflight", op, str(repeats), str(seed), precision, "{fd}",
+                "./preflight", op, str(repeats), str(seed), precision, "{fd}", "{phase_fd}",
             ]
             control = json.dumps({"nonce": nonce, "out": MEASUREMENT_FILE})
         else:
@@ -320,6 +320,7 @@ def preflight_source(
                 "--seed", str(seed),
                 "--precision", precision,
                 "--result-fd", "{fd}",
+                "--phase-fd", "{phase_fd}",
             ]
             # Deliberately not flags. driver.py runs a supervisor that spawns the
             # process which imports the candidate, and passes it neither of these,

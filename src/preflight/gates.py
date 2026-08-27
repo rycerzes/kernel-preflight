@@ -74,6 +74,11 @@ IMPLAUSIBLE_FRACTION = 0.95
 # enough for the DRAM roofline to bound it.
 L2_CLEARANCE = 2.0
 
+# How much the provenance bound forgives the median being an estimator rather than a
+# mean. Measured headroom between the claim and the externally observed interval is
+# 1.16-1.19x on honest kernels, so 1.05 leaves the check meaningful.
+SAMPLE_ESTIMATOR_ALLOWANCE = 1.05
+
 # Dense FLOPs per SM per clock, by compute capability and precision class.
 #
 # Derived from published *dense* peak TFLOPS divided by (SM count x boost clock),
@@ -542,19 +547,48 @@ def check_provenance(measurement: dict[str, Any]) -> GateResult:
             f"{observed_ms:.0f} ms — it cannot have spent time that did not elapse",
         )
 
-    # Internal consistency: the timed loops alone cannot exceed the whole run.
-    timed_ms = sum(s["median_ms"] for s in measurement["shapes"]) * prov["repeats"]
-    if timed_ms > claimed_ms:
+    # Internal consistency: the timed loops alone cannot exceed the run that
+    # contained them.
+    #
+    # `median_ms` is per *launch*, and each sample batches `inner_iters` launches, so
+    # the wall time a shape's loops actually consumed is median x inner x repeats.
+    # Leaving `inner_iters` out understated the claim by up to 40x on the small
+    # shapes, which made this check vacuous rather than merely loose.
+    #
+    # SAMPLE_ESTIMATOR_ALLOWANCE covers the median being an estimator rather than a
+    # mean: a left-skewed sample could put median slightly above the average launch.
+    # Timing distributions skew right, so this is a guard against a shape of noise
+    # that has not been observed here, sized well inside the measured headroom.
+    timed_ms = (
+        sum(s["median_ms"] * max(1, int(s.get("inner_iters", 1) or 1)) for s in measurement["shapes"])
+        * prov["repeats"]
+        / SAMPLE_ESTIMATOR_ALLOWANCE
+    )
+
+    # Prefer the interval the supervisor timed around the loops themselves. The
+    # whole-process figure carries seconds of torch import and float64 reference
+    # computation, and that slack is exactly what a forged measurement spends: a
+    # claim of 30 ms of timed work sits comfortably inside a 5-second process.
+    phase_ms = measurement.get("timed_phase_ms")
+    bound_ms, bound_name = (
+        (float(phase_ms), "the timed loops the supervisor observed")
+        if isinstance(phase_ms, (int, float)) and phase_ms > 0
+        else (claimed_ms, "the run")
+    )
+    if timed_ms > bound_ms:
         return GateResult(
             "provenance",
             GateStatus.FAIL,
-            f"timed loops sum to {timed_ms:.0f} ms inside a {claimed_ms:.0f} ms run",
+            f"timed loops sum to {timed_ms:.0f} ms inside {bound_ms:.0f} ms of "
+            f"{bound_name}",
         )
 
+    tightness = f", {timed_ms:.0f} ms of it inside {bound_ms:.0f} ms of timed loops" if phase_ms else ""
     return GateResult(
         "provenance",
         GateStatus.PASS,
-        f"nonce echoed; {claimed_ms:.0f} ms of work inside a {observed_ms:.0f} ms process",
+        f"nonce echoed; {claimed_ms:.0f} ms of work inside a {observed_ms:.0f} ms process"
+        f"{tightness}",
     )
 
 

@@ -5,13 +5,25 @@
 // writing to a file instead. This one goes after the file.
 //
 // A C++ static constructor runs before main and is not passed argv, but
-// /proc/self/cmdline is readable and contains it. The harness is invoked as
+// /proc/self/cmdline is readable and contains it. The harness used to be invoked as
 //
 //   ./preflight <op> <repeats> <seed> <nonce> <precision> <measurement-file>
 //
-// so a constructor can recover both the nonce the provenance gate checks and the
+// so a constructor could recover both the nonce the provenance gate checks and the
 // path the verdict is written to, write a measurement claiming 92% of the memory
-// bus, and _exit(0) before the harness runs at all.
+// bus, and _exit(0) before the harness ran at all. It was admitted.
+//
+// It no longer works, and not because reading /proc got harder. The invocation is now
+//
+//   ./preflight <op> <repeats> <seed> <precision> <result-fd> <phase-fd>
+//
+// which carries neither secret: supervisor.py holds the nonce and the output path and
+// never passes them to the process that links the candidate. This file therefore
+// recovers nothing useful, writes its forgery to a path derived from a descriptor
+// number, and the supervisor reports that the worker produced no measurement.
+//
+// Kept because that is the whole argument: the defence is which process knows what,
+// not how well the values are hidden inside one.
 //
 // Kept as a regression test. It must never be admitted.
 

@@ -282,7 +282,11 @@ struct ShapeResult {
   double working_set_bytes;
 };
 
-ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned int seed) {
+// `phase_fd` brackets the timed loop so the supervisor can time it from outside this
+// process. See supervisor.py: the whole-process figure carries seconds of setup that a
+// forged measurement could spend, and this removes that slack.
+ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned int seed,
+                    int phase_fd) {
   const size_t count = static_cast<size_t>(rows) * cols;
   const size_t bytes = count * sizeof(float);
   const float eps = 1e-6f;
@@ -365,12 +369,22 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
     inner = wanted > 1000.0 ? 1000 : static_cast<int>(wanted) + 1;
   }
 
+  if (phase_fd >= 0) {
+    const char begin = 'B';
+    ssize_t ignored = write(phase_fd, &begin, 1);
+    (void)ignored;
+  }
   for (int i = 0; i < repeats; ++i) {
     auto t0 = std::chrono::steady_clock::now();
     for (int j = 0; j < inner; ++j) launch_candidate(d_x, d_w, d_y, rows, cols, eps, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
     auto t1 = std::chrono::steady_clock::now();
     samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count() / inner);
+  }
+  if (phase_fd >= 0) {
+    const char end = 'E';
+    ssize_t ignored = write(phase_fd, &end, 1);
+    (void)ignored;
   }
   CUDA_CHECK(cudaGetLastError());
 
@@ -467,6 +481,8 @@ int main(int argc, char** argv) {
   // pipe this descriptor refers to, and is the only writer of the verdict. See
   // supervisor.py for what the split does and does not guarantee.
   int result_fd = argc > 5 ? std::atoi(argv[5]) : -1;
+  // Optional: absent when the caller does not want the timed loops bracketed.
+  int phase_fd = argc > 6 ? std::atoi(argv[6]) : -1;
   if (result_fd < 0) {
     std::fprintf(stderr, "no result descriptor given\n");
     return 4;
@@ -519,7 +535,7 @@ int main(int argc, char** argv) {
   std::fprintf(out, "  \"seed\": %u,\n", seed);
   std::fprintf(out, "  \"shapes\": [\n");
   for (int i = 0; i < shape_count; ++i) {
-    ShapeResult r = measure(*op, shapes[i][0], shapes[i][1], repeats, seed + static_cast<unsigned int>(i));
+    ShapeResult r = measure(*op, shapes[i][0], shapes[i][1], repeats, seed + static_cast<unsigned int>(i), phase_fd);
     std::fprintf(out, "    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"p90_ms\": %.6f, \"p25_ms\": %.6f, \"p75_ms\": %.6f, \"outliers\": %d, \"max_ms\": %.6f, "
                 "\"max_abs_err\": %.6g, \"max_rel_err\": %.6g, \"violation\": %.6g, \"has_nonfinite\": %s, "
                 "\"wrote_output\": %s, \"input_sensitive\": %s, "

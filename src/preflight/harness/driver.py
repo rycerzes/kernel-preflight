@@ -420,7 +420,16 @@ def current_sm_clock_hz() -> float | None:
         return None
 
 
-def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[str, Any]:
+def measure_problem(problem: Problem, launch: Callable, repeats: int,
+                    phase_fd: int = -1) -> dict[str, Any]:
+    """Measure one shape. `phase_fd` brackets the timed loop for the supervisor.
+
+    The supervisor cannot see inside this process, but it can see when bytes arrive
+    on a pipe. Writing a marker either side of the timing loop lets it time that
+    loop from outside, which is a far tighter bound than the whole worker lifetime:
+    that includes several seconds of torch import and float64 reference computation,
+    all of which was slack a forged measurement could spend.
+    """
     out = problem.out
 
     # Poison, so a kernel that never writes is visible rather than fast.
@@ -465,6 +474,9 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
     if 0.0 < pilot_ms < target_sample_ms:
         inner = min(1000, int(target_sample_ms / pilot_ms) + 1)
 
+    if phase_fd >= 0:
+        os.write(phase_fd, b"B")
+
     samples: list[float] = []
     clocks: list[float] = []
     for _ in range(repeats):
@@ -476,6 +488,9 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
         clock = current_sm_clock_hz()
         if clock:
             clocks.append(clock)
+
+    if phase_fd >= 0:
+        os.write(phase_fd, b"E")
 
     # Revalidate what the last *measured* call produced.
     #
@@ -579,7 +594,7 @@ def load_candidate(path: str) -> Callable:
     return launch
 
 
-def run_worker(args: argparse.Namespace, result_fd: int) -> int:
+def run_worker(args: argparse.Namespace, result_fd: int, phase_fd: int = -1) -> int:
     """Measure the candidate and report on a file descriptor. Untrusted.
 
     This is the only process that imports candidate code, and it is deliberately
@@ -607,7 +622,7 @@ def run_worker(args: argparse.Namespace, result_fd: int) -> int:
     shapes_out = []
     for index, dims in enumerate(shapes):
         problem = builder(dims[0], dims[1], args.seed + index, dev, dt)
-        record = measure_problem(problem, launch, payload["repeats"])
+        record = measure_problem(problem, launch, payload["repeats"], phase_fd)
         # The schema names these rows/cols for compatibility with the CUDA
         # harness; they are labels, and ops with other layouts report their own.
         record["rows"], record["cols"] = dims
@@ -634,6 +649,13 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument("--seed", type=int, default=20260826)
     parser.add_argument(
+        "--phase-fd",
+        type=int,
+        default=-1,
+        help="Descriptor to bracket each timed loop on, so the supervisor can time "
+             "the measurement from outside this process.",
+    )
+    parser.add_argument(
         "--result-fd",
         type=int,
         required=True,
@@ -647,7 +669,7 @@ def main() -> int:
              "Sets both the correctness tolerance and which hardware ceiling binds.",
     )
     args = parser.parse_args()
-    return run_worker(args, args.result_fd)
+    return run_worker(args, args.result_fd, args.phase_fd)
 
 
 if __name__ == "__main__":

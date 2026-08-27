@@ -50,6 +50,13 @@ CASES = [
     ("cheat_python_forge.py",         "rmsnorm",   "torch",    "fp32", "forges a verdict from sys.argv at import"),
     ("cheat_timed_nan.py",            "rmsnorm",   "torch",    "fp32", "one true value and NaNs, only while timed"),
     ("cheat_silent_bf16.py",          "attention", "torch",    "fp32", "computes in bf16 while declaring fp32"),
+    # --- Reduced storage precision, on the backends that can honour it.
+    ("triton_rmsnorm.py",             "rmsnorm",   "triton",   "fp16", "fp16 storage"),
+    ("tilelang_rmsnorm.py",           "rmsnorm",   "tilelang", "bf16", "bf16 storage"),
+    ("tilelang_silu.py",              "silu",      "tilelang", "fp16", "fp16 storage"),
+    ("cute_rmsnorm.py",               "rmsnorm",   "cute",     "bf16", "bf16 storage"),
+    ("cute_rmsnorm.py",               "rmsnorm",   "cute",     "fp16", "fp16 storage"),
+    ("triton_flash_attention.py",     "attention", "triton",   "fp16", "fp16 tensor cores"),
     # Last on purpose: autotuning runs for minutes and leaves the GPU hot.
     ("helion_rmsnorm.py",             "rmsnorm",   "helion",   "fp32", "Helion (autotuned)"),
 ]
