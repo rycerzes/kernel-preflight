@@ -268,7 +268,7 @@ and it is not done.
 | `tests/` | 35 gate tests, including the ones that fail against the pre-fix code |
 | `agent/` | the saved TrueForge agent manifest |
 | `docker/` | the sandbox images: CUDA, plus torch/Triton/Helion/CuTe/TileLang |
-| `upstream/trueforge/` | changes to TrueForge itself, mirroring upstream paths for a clean PR |
+| `upstream/trueforge/` | changes to TrueForge itself, submitted upstream as [truefoundry/trueforge#467](https://github.com/truefoundry/trueforge/pull/467) |
 | `docs/` | investigation notes |
 
 ## Qodo Code Review Evidence
@@ -397,5 +397,9 @@ happens in a container with no network and no inherited environment.
 ## Notes
 
 - Built with AI assistance (Claude Code), as permitted by the hackathon rules.
-- `upstream/` is intended for a pull request to `truefoundry/trueforge`; it is
-  mirrored here so this repository is self-contained and reviewable.
+- `upstream/` is mirrored here so this repository is self-contained and reviewable.
+  It is submitted upstream as
+  [truefoundry/trueforge#467](https://github.com/truefoundry/trueforge/pull/467),
+  raised behind [#466](https://github.com/truefoundry/trueforge/issues/466) because
+  TrueForge asks for maintainer approval before code contributions. Whether they take
+  it is theirs to decide; the analysis in the issue stands either way.

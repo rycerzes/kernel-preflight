@@ -84,9 +84,15 @@ patch, but it has no unknown-unknowns, and it is the industry-standard answer to
 this exact problem.
 
 It also stands on its own merits regardless of GPUs. Requests for non-Daytona
-sandbox backends are open upstream -- E2B (#387, `help wanted`) and ComputeSDK
-(#414) -- and now that Daytona cannot be self-hosted, a container provider is the
-only route to a fully self-hosted TrueForge.
+sandbox backends exist upstream -- E2B ([#387](https://github.com/truefoundry/trueforge/issues/387),
+`help wanted`, open) and ComputeSDK
+([#414](https://github.com/truefoundry/trueforge/issues/414), since closed) -- and
+now that Daytona cannot be self-hosted, a container provider is the only route to a
+fully self-hosted TrueForge.
+
+This landed upstream as
+[#466](https://github.com/truefoundry/trueforge/issues/466) (the analysis) and
+[#467](https://github.com/truefoundry/trueforge/pull/467) (the implementation).
 
 `LocalSandboxProvider` is the reference to port from: same `SandboxProvider`
 interface, same path-shaped `sandboxId`, same file-transfer and traversal-validation
