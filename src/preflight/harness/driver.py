@@ -735,6 +735,273 @@ def _attention_decode(seq: int, head_dim: int, seed: int, dev: torch.device,
     )
 
 
+def _attention_gqa(seq: int, head_dim: int, seed: int, dev: torch.device,
+                   dt: torch.dtype) -> Problem:
+    """Grouped-query attention: 32 query heads sharing 8 KV heads, as Llama 3 ships it.
+
+    The reason GQA exists is a traffic asymmetry, and that asymmetry is the whole
+    difficulty for a kernel. Query and output are full width; K and V are a quarter of
+    it. So the arithmetic is identical to multi-head attention -- every query head still
+    attends over the whole sequence -- while the KV traffic is divided by the group size,
+    which is what shrinks the cache during generation.
+
+    A kernel gets this wrong in one of two ways, and the harness can tell them apart.
+    Materialising the expansion with a `repeat_interleave` before the attention is
+    correct and throws the entire benefit away: it reads each KV head four times and the
+    measured bandwidth reflects it. Indexing the shared KV head from four query programs
+    instead keeps the traffic where GQA promises it, and the compulsory-traffic model
+    below charges the shared reads once, so a kernel that expands cannot hide behind a
+    cost model that already assumed it did.
+    """
+    batch, heads_q, heads_kv = 4, 32, 8
+    group = heads_q // heads_kv
+    q_shape = (batch, heads_q, seq, head_dim)
+    kv_shape = (batch, heads_kv, seq, head_dim)
+    q = make_input(q_shape, seed, dev, exponent_range=0, dtype=dt)
+    k = make_input(kv_shape, seed ^ 0xA11, dev, exponent_range=0, dtype=dt)
+    v = make_input(kv_shape, seed ^ 0xB22, dev, exponent_range=0, dtype=dt)
+
+    def _ref() -> torch.Tensor:
+        # Expanded explicitly rather than via enable_gqa, so the reference does not
+        # depend on which torch version is installed.
+        kd = k.double().repeat_interleave(group, dim=1)
+        vd = v.double().repeat_interleave(group, dim=1)
+        return torch.nn.functional.scaled_dot_product_attention(q.double(), kd, vd)
+
+    ref = _ref()
+    q_elements = batch * heads_q * seq * head_dim
+    kv_elements = batch * heads_kv * seq * head_dim
+    return Problem(
+        label=f"b{batch}h{heads_q}kv{heads_kv}s{seq}d{head_dim}",
+        inputs={"q": q, "k": k, "v": v},
+        out=torch.empty(q_shape, device=dev, dtype=dt),
+        meta={"batch": batch, "heads_q": heads_q, "heads_kv": heads_kv,
+              "group": group, "seq": seq, "head_dim": head_dim},
+        reference=ref,
+        recompute=_ref,
+        # q and o at full width, k and v at a quarter of it, each read once.
+        bytes_moved=float((2 * q_elements + 2 * kv_elements) * dt.itemsize),
+        # Every query head attends over the whole sequence, so the arithmetic is the
+        # same as multi-head attention. Only the traffic shrinks.
+        flops=4.0 * batch * heads_q * seq * seq * head_dim,
+        working_set_bytes=float((2 * q_elements + 2 * kv_elements) * dt.itemsize),
+        rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=24.0,
+    )
+
+
+def _moe_gemm(tokens: int, hidden: int, seed: int, dev: torch.device,
+              dt: torch.dtype) -> Problem:
+    """Grouped GEMM for a mixture of experts: out[i] = x[i] @ w[expert[i]].
+
+    The kernel a sparse model spends most of its time in, and the one where the
+    difficulty is neither the arithmetic nor the memory pattern but the *grouping*. Each
+    token needs a different weight matrix, so there is no single GEMM to write. The
+    standard shape of a solution is permute, grouped GEMM, unpermute: sort the tokens by
+    expert so each tile of the output is a contiguous run against one weight matrix, do
+    the multiplication, then scatter the rows back.
+
+    Compute-bound at these sizes -- intensity is around 128 FLOP/byte against a ridge
+    point near 82 -- so it is audited against the arithmetic ceiling. The traffic model
+    charges every expert's weights once, because with tokens spread over eight experts
+    all of them are touched, and charges x and the output once each.
+
+    The routing is uniform-random rather than skewed. Real routers are not, and load
+    imbalance is a large part of why MoE kernels are hard, but a skewed distribution
+    would make the arithmetic per expert data-dependent and the FLOP count would stop
+    being a property of the shape. Uniform keeps the cost model exact, which the gather
+    op already demonstrated matters more than realism in a benchmark.
+    """
+    experts = 8
+    n = hidden
+    x = make_input((tokens, hidden), seed, dev, exponent_range=0, dtype=dt)
+    w = make_input((experts, hidden, n), seed ^ 0xE0E0, dev, exponent_range=0, dtype=dt)
+    gen = torch.Generator(device=dev).manual_seed(seed ^ 0x3EE7)
+    expert = torch.randint(0, experts, (tokens,), generator=gen, device=dev,
+                           dtype=torch.int64)
+
+    def _ref() -> torch.Tensor:
+        xd, wd = x.double(), w.double()
+        result = torch.empty((tokens, n), device=dev, dtype=torch.float64)
+        for e in range(experts):
+            rows = expert == e
+            if bool(rows.any()):
+                result[rows] = xd[rows] @ wd[e]
+        return result
+
+    ref = _ref()
+    return Problem(
+        label=f"t{tokens}h{hidden}e{experts}",
+        inputs={"x": x, "w": w, "expert": expert},
+        out=torch.empty((tokens, n), device=dev, dtype=dt),
+        meta={"tokens": tokens, "hidden": hidden, "n": n, "experts": experts},
+        reference=ref,
+        recompute=_ref,
+        # x once, every expert's weights once, the output once.
+        bytes_moved=float((tokens * hidden + experts * hidden * n + tokens * n) * dt.itemsize),
+        # One GEMM row per token, whichever expert it lands on.
+        flops=2.0 * tokens * hidden * n,
+        working_set_bytes=float((tokens * hidden + experts * hidden * n + tokens * n) * dt.itemsize),
+        rel_tol=accumulation_tolerance(hidden, dt=dt),
+    )
+
+
+def _attention_paged(seq: int, head_dim: int, seed: int, dev: torch.device,
+                     dt: torch.dtype) -> Problem:
+    """Paged decode attention: the KV cache lives in scattered fixed-size blocks.
+
+    The kernel a serving stack is built around. Instead of a contiguous cache per
+    sequence, the pool is a flat array of `block_size`-position blocks and each sequence
+    owns a list of physical block indices -- a block table. That is what lets a server
+    grow a sequence without reserving its maximum length up front, and it is why the
+    kernel cannot simply stream.
+
+    Two of this harness's op families in one: the arithmetic and the softmax are decode
+    attention, and the addressing is `gather`. A kernel walks the block table, resolves
+    each logical block to a physical one, and streams 16 positions at a time from an
+    unpredictable place in the pool.
+
+    Memory-bound like ordinary decode -- intensity around 0.5 FLOP/byte -- but the
+    indirection puts a floor under how well it can stream that plain decode does not
+    have. The blocks are laid out as a random permutation of the pool, so consecutive
+    logical blocks are nowhere near each other, and 16 positions of one head is 8 KB:
+    large enough to be a real burst, small enough that the scatter is not amortised away.
+
+    Sequence lengths are uniform. Real serving is ragged, and the imbalance is a genuine
+    part of why these kernels are hard, but ragged lengths would make the FLOP count
+    data-dependent rather than a property of the shape -- the same reason the MoE routing
+    here is uniform.
+    """
+    batch, heads = 4, 8
+    block_size = 16
+    assert seq % block_size == 0, "sequence must divide into whole blocks"
+    blocks_per_seq = seq // block_size
+    # A pool with slack, so physical blocks are genuinely scattered rather than a
+    # sequence-ordered layout that happens to be contiguous.
+    pool_blocks = int(batch * blocks_per_seq * 1.25)
+
+    q = make_input((batch, heads, 1, head_dim), seed, dev, exponent_range=0, dtype=dt)
+    k_cache = make_input((pool_blocks, block_size, heads, head_dim), seed ^ 0xA11, dev,
+                         exponent_range=0, dtype=dt)
+    v_cache = make_input((pool_blocks, block_size, heads, head_dim), seed ^ 0xB22, dev,
+                         exponent_range=0, dtype=dt)
+
+    gen = torch.Generator(device=dev).manual_seed(seed ^ 0x9A6E)
+    # A permutation, so every sequence gets distinct blocks and the traffic model is
+    # exact: each block is read once and only once.
+    chosen = torch.randperm(pool_blocks, generator=gen, device=dev)[: batch * blocks_per_seq]
+    block_table = chosen.view(batch, blocks_per_seq).to(torch.int32)
+
+    def _ref() -> torch.Tensor:
+        # (batch, blocks, block_size, heads, head_dim) -> (batch, heads, seq, head_dim)
+        kg = k_cache.double()[block_table.long()]
+        vg = v_cache.double()[block_table.long()]
+        kg = kg.permute(0, 3, 1, 2, 4).reshape(batch, heads, seq, head_dim)
+        vg = vg.permute(0, 3, 1, 2, 4).reshape(batch, heads, seq, head_dim)
+        return torch.nn.functional.scaled_dot_product_attention(q.double(), kg, vg)
+
+    ref = _ref()
+    cache_elements = batch * heads * seq * head_dim
+    query_elements = batch * heads * head_dim
+    return Problem(
+        label=f"b{batch}h{heads}s{seq}d{head_dim}bs{block_size}",
+        inputs={"k_cache": k_cache, "v_cache": v_cache, "q": q,
+                "block_table": block_table},
+        out=torch.empty((batch, heads, 1, head_dim), device=dev, dtype=dt),
+        meta={"batch": batch, "heads": heads, "seq": seq, "head_dim": head_dim,
+              "block_size": block_size, "blocks_per_seq": blocks_per_seq,
+              "pool_blocks": pool_blocks},
+        reference=ref,
+        recompute=_ref,
+        # Only the blocks this batch owns are touched, once each, plus q and o.
+        bytes_moved=float((2 * cache_elements + 2 * query_elements) * dt.itemsize),
+        flops=4.0 * batch * heads * seq * head_dim,
+        working_set_bytes=float((2 * cache_elements + 2 * query_elements) * dt.itemsize),
+        rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=24.0,
+    )
+
+
+def _attention_backward(seq: int, head_dim: int, seed: int, dev: torch.device,
+                        dt: torch.dtype) -> Problem:
+    """Attention backward: dQ, dK and dV from Q, K, V and dO.
+
+    Training's half of attention, and roughly two and a half times the arithmetic of the
+    forward pass, so it is where a training step actually spends its attention budget.
+    It is also the only op here with more than one output, which the harness's
+    single-tensor contract handles by stacking them: `out` is (3, batch, heads, seq,
+    head_dim) holding dQ, dK, dV. That is not a dodge -- a kernel has to produce all
+    three consistently, and stacking means a candidate that gets dV right and dK wrong
+    cannot pass on average.
+
+    The difficulty a Flash backward exists to solve is that dQ, dK and dV all need the
+    attention probabilities P, which the forward pass did not keep. A materialising
+    implementation stores the seq x seq matrix and reads it back; a Flash implementation
+    recomputes S tile by tile from Q and K and never writes it. Both do the same
+    arithmetic and the traffic differs by O(seq^2), so `flops` here counts the recompute
+    -- ten seq^2 terms per head rather than eight -- and `bytes_moved` counts only the
+    four inputs and three outputs. A kernel that materialises therefore moves more than
+    it is charged for and measures slower, which is the honest way round.
+
+    dV = P^T dO, dP = dO V^T, dS = P * (dP - rowsum(dP * P)), dQ = dS K, dK = dS^T Q.
+    The rowsum term is the softmax Jacobian and is the part that couples the whole row,
+    which is why a backward kernel cannot be tiled as freely as a forward one.
+    """
+    batch, heads = 4, 8
+    shape = (batch, heads, seq, head_dim)
+    q = make_input(shape, seed, dev, exponent_range=0, dtype=dt)
+    k = make_input(shape, seed ^ 0xA11, dev, exponent_range=0, dtype=dt)
+    v = make_input(shape, seed ^ 0xB22, dev, exponent_range=0, dtype=dt)
+    do = make_input(shape, seed ^ 0xD00, dev, exponent_range=0, dtype=dt)
+
+    def _ref() -> torch.Tensor:
+        # Fresh leaves each time: recompute is called again after the timed samples
+        # have rotated an input, and autograd will not reuse a graph.
+        qd = q.double().detach().requires_grad_(True)
+        kd = k.double().detach().requires_grad_(True)
+        vd = v.double().detach().requires_grad_(True)
+        o = torch.nn.functional.scaled_dot_product_attention(qd, kd, vd)
+        o.backward(do.double())
+        return torch.stack((qd.grad, kd.grad, vd.grad))
+
+    ref = _ref()
+    elements = batch * heads * seq * head_dim
+    return Problem(
+        label=f"b{batch}h{heads}s{seq}d{head_dim}",
+        inputs={"q": q, "k": k, "v": v, "do": do},
+        out=torch.empty((3,) + shape, device=dev, dtype=dt),
+        meta={"batch": batch, "heads": heads, "seq": seq, "head_dim": head_dim},
+        reference=ref,
+        recompute=_ref,
+        # q, k, v, do read; dq, dk, dv written.
+        bytes_moved=float(7 * elements * dt.itemsize),
+        # Counted as the arithmetic the operation requires given these inputs, in units
+        # of 2*b*h*s*s*d:
+        #
+        #   forward recompute for L and D   S (2) + P V (2)  = 4
+        #   dk/dv pass                      S (2) + dV (2) + dP (2) + dK (2) = 8
+        #   dq, fused into that pass        dQ (2)           = 2
+        #                                                     --
+        #                                                     14
+        #
+        # The forward recompute is not optional here. A training step saves `O` and the
+        # row logsumexp from its forward pass and a real backward kernel is handed them;
+        # this op is given only Q, K, V and dO, so recovering them is part of the work
+        # and charging for it is the difference between grading the kernel and grading
+        # the calling convention.
+        #
+        # 14 rather than 18 on purpose. Recomputing S in a third pass to get dQ is what
+        # a straightforward implementation does -- triton_attention_backward.py does
+        # exactly that -- but folding dQ into the dk/dv pass with atomics needs only two
+        # recomputes. Charging the cheaper figure means the third pass shows up as a
+        # lower number rather than being absorbed into the model.
+        flops=14.0 * batch * heads * seq * seq * head_dim,
+        working_set_bytes=float(7 * elements * dt.itemsize),
+        rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=24.0,
+    )
+
+
 # Shapes per op. Memory-bound ops sweep across the L2 boundary on purpose;
 # compute-bound ops stay small enough that a float64 reference is affordable.
 OPS: dict[str, tuple[Callable[..., Problem], tuple[tuple[int, int], ...]]] = {
@@ -756,6 +1023,10 @@ OPS: dict[str, tuple[Callable[..., Problem], tuple[tuple[int, int], ...]]] = {
     "attention_causal": (_attention_causal, ((512, 64), (1024, 64), (2048, 64), (1024, 128))),
     # Cache lengths, not prefill lengths: long enough that K and V clear 2x L2.
     "attention_decode": (_attention_decode, ((2048, 128), (8192, 128), (16384, 128), (32768, 128))),
+    "attention_gqa": (_attention_gqa, ((512, 128), (1024, 128), (2048, 128))),
+    "moe_gemm": (_moe_gemm, ((2048, 1024), (4096, 1024), (8192, 1024), (4096, 2048))),
+    "attention_paged": (_attention_paged, ((2048, 128), (4096, 128), (8192, 128))),
+    "attention_backward": (_attention_backward, ((512, 64), (1024, 64), (2048, 64), (1024, 128))),
 }
 
 

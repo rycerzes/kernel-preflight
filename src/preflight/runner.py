@@ -62,7 +62,8 @@ PYTHON_OPS = (
     "rope", "gather", "cross_entropy",
     # Causal changes the FLOP count; decode moves attention to the other side of the
     # ridge point, so the same schema gets audited against a different ceiling.
-    "attention_causal", "attention_decode",
+    "attention_causal", "attention_decode", "attention_gqa", "moe_gemm",
+    "attention_paged", "attention_backward",
 )
 PYTHON_BACKENDS = ("triton", "helion", "torch", "cute", "tilelang")
 SUPPORTED_BACKENDS = ("cuda", *PYTHON_BACKENDS)

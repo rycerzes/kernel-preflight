@@ -77,8 +77,14 @@ def device_spec() -> dict[str, Any]:
         "bandwidth at any quality), and cross_entropy (inputs logits, target; one "
         "unreduced loss per row, so the output is smaller than the input), "
         "attention_causal (masked, so the FLOP count is halved and the cost model says "
-        "so) and attention_decode (one query against a KV cache, which is memory-bound "
-        "rather than compute-bound and is audited against the bus)."
+        "so), attention_decode (one query against a KV cache, memory-bound rather than "
+        "compute-bound and audited against the bus), attention_gqa (32 query heads "
+        "sharing 8 KV heads, where the win is indexing the shared head rather than "
+        "expanding it), attention_paged (the KV cache in scattered fixed-size blocks "
+        "addressed through a block table), attention_backward (dQ, dK, dV stacked into "
+        "one output; the forward's probabilities are not given, so recomputing them is "
+        "part of the work) and moe_gemm (out[i] = x[i] @ w[expert[i]]; the difficulty "
+        "is the grouping, not the arithmetic)."
     ),
 )
 def preflight_kernel(
@@ -88,8 +94,8 @@ def preflight_kernel(
         Field(
             description="Operation to measure: rmsnorm, softmax, silu or transpose on any "
             "backend; matmul, attention, layernorm, swiglu, quantize, rope, gather, "
-            "cross_entropy, attention_causal and attention_decode on the Python "
-            "backends only."
+            "cross_entropy, attention_causal, attention_decode, attention_gqa, "
+            "attention_paged, attention_backward and moe_gemm on the Python backends only."
         ),
     ] = "rmsnorm",
     arch: Annotated[str, Field(description="Target architecture, e.g. sm_89.")] = "sm_89",

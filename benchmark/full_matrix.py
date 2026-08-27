@@ -67,6 +67,17 @@ CASES = [
     ("triton_flash_attention_causal.py",  "attention_causal", "triton", "bf16", "same kernel, bf16"),
     ("torch_attention_decode.py",         "attention_decode", "torch",  "fp32", "SDPA on a single query"),
     ("triton_attention_decode.py",        "attention_decode", "triton", "fp32", "one program per head"),
+    # --- Attention and MoE as a serving stack actually runs them.
+    ("torch_attention_gqa.py",            "attention_gqa",      "torch",  "fp32", "expands the KV heads"),
+    ("triton_attention_gqa.py",           "attention_gqa",      "triton", "tf32", "indexes the shared KV head"),
+    ("triton_attention_gqa.py",           "attention_gqa",      "triton", "bf16", "same kernel, bf16"),
+    ("torch_attention_paged.py",          "attention_paged",    "torch",  "fp32", "gathers the blocks first"),
+    ("triton_attention_paged.py",         "attention_paged",    "triton", "fp32", "walks the block table"),
+    ("torch_attention_backward.py",       "attention_backward", "torch",  "fp32", "autograd over fused SDPA"),
+    ("triton_attention_backward.py",      "attention_backward", "triton", "fp32", "three kernels, no seq^2 stored"),
+    ("triton_attention_backward.py",      "attention_backward", "triton", "bf16", "same kernel, bf16"),
+    ("torch_moe_gemm.py",                 "moe_gemm",           "torch",  "fp32", "one GEMM per expert"),
+    ("triton_moe_gemm.py",                "moe_gemm",           "triton", "fp32", "permute, grouped GEMM, scatter"),
     # --- Wrong, but not dishonest. Must fail on correctness with a readable reason.
     ("wrong_transpose.cu",            "transpose", "cuda",     "fp32", "off by one row"),
     # --- Adversarial. Every one of these must be rejected.
