@@ -116,6 +116,11 @@ def make_input(
 # ---------------------------------------------------------------------------
 
 
+# Added to one input before each timed sample so no cached answer stays correct.
+# Small enough not to change the numerical regime, large enough to exceed any
+# tolerance the gates apply.
+DRIFT_STEP = 0.125
+
 FP32_EPS = 1.1920929e-07
 
 
@@ -157,6 +162,10 @@ class Problem:
     out: torch.Tensor
     meta: dict[str, Any]
     reference: torch.Tensor  # float64, computed by the harness
+    # Recomputes `reference` from whatever the input tensors currently hold. The
+    # timing loop perturbs an input before every sample, so the answer changes
+    # constantly and a candidate cannot serve one it computed earlier.
+    recompute: Callable[[], torch.Tensor]
     bytes_moved: float
     flops: float
     working_set_bytes: float
@@ -167,8 +176,11 @@ def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype
     x = make_input((rows, cols), seed, dev, dtype=dt)
     w = make_input((cols,), seed ^ 0x5EED, dev, dtype=dt)
     eps = 1e-6
-    xd, wd = x.double(), w.double()
-    ref = xd * torch.rsqrt(xd.pow(2).mean(dim=-1, keepdim=True) + eps) * wd
+    def _ref() -> torch.Tensor:
+        xd, wd = x.double(), w.double()
+        return xd * torch.rsqrt(xd.pow(2).mean(dim=-1, keepdim=True) + eps) * wd
+
+    ref = _ref()
     n = rows * cols
     return Problem(
         label=f"{rows}x{cols}",
@@ -176,6 +188,7 @@ def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype
         out=torch.empty_like(x),
         meta={"rows": rows, "cols": cols, "eps": eps},
         reference=ref,
+        recompute=_ref,
         bytes_moved=2.0 * n * dt.itemsize,
         flops=4.0 * n,
         working_set_bytes=2.0 * n * dt.itemsize,
@@ -185,7 +198,11 @@ def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype
 
 def _softmax(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     x = make_input((rows, cols), seed, dev, dtype=dt)
-    ref = torch.softmax(x.double(), dim=-1)
+
+    def _ref() -> torch.Tensor:
+        return torch.softmax(x.double(), dim=-1)
+
+    ref = _ref()
     n = rows * cols
     return Problem(
         label=f"{rows}x{cols}",
@@ -193,6 +210,7 @@ def _softmax(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype
         out=torch.empty_like(x),
         meta={"rows": rows, "cols": cols},
         reference=ref,
+        recompute=_ref,
         bytes_moved=2.0 * n * dt.itemsize,
         flops=5.0 * n,
         working_set_bytes=2.0 * n * dt.itemsize,
@@ -202,8 +220,12 @@ def _softmax(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype
 
 def _silu(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     x = make_input((rows, cols), seed, dev, dtype=dt)
-    xd = x.double()
-    ref = xd * torch.sigmoid(xd)
+
+    def _ref() -> torch.Tensor:
+        xd = x.double()
+        return xd * torch.sigmoid(xd)
+
+    ref = _ref()
     n = rows * cols
     return Problem(
         label=f"{rows}x{cols}",
@@ -211,6 +233,7 @@ def _silu(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -
         out=torch.empty_like(x),
         meta={"rows": rows, "cols": cols},
         reference=ref,
+        recompute=_ref,
         bytes_moved=2.0 * n * dt.itemsize,
         flops=4.0 * n,
         working_set_bytes=2.0 * n * dt.itemsize,
@@ -220,7 +243,11 @@ def _silu(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -
 
 def _transpose(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     x = make_input((rows, cols), seed, dev, dtype=dt)
-    ref = x.double().t().contiguous()
+
+    def _ref() -> torch.Tensor:
+        return x.double().t().contiguous()
+
+    ref = _ref()
     n = rows * cols
     return Problem(
         label=f"{rows}x{cols}",
@@ -228,6 +255,7 @@ def _transpose(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dty
         out=torch.empty((cols, rows), device=dev, dtype=dt),
         meta={"rows": rows, "cols": cols},
         reference=ref,
+        recompute=_ref,
         bytes_moved=2.0 * n * dt.itemsize,
         flops=0.0,
         # Pure data movement: bit-exact, so no accumulation allowance.
@@ -249,13 +277,17 @@ def _matmul(m: int, k: int, seed: int, dev: torch.device, dt: torch.dtype) -> Pr
     # more precision to cancellation than any tolerance should forgive.
     a = make_input((m, k), seed, dev, exponent_range=0, dtype=dt)
     b = make_input((k, n), seed ^ 0xB00, dev, exponent_range=0, dtype=dt)
-    ref = a.double() @ b.double()
+    def _ref() -> torch.Tensor:
+        return a.double() @ b.double()
+
+    ref = _ref()
     return Problem(
         label=f"{m}x{k}x{n}",
         inputs={"a": a, "b": b},
         out=torch.empty((m, n), device=dev, dtype=dt),
         meta={"m": m, "k": k, "n": n},
         reference=ref,
+        recompute=_ref,
         bytes_moved=float((m * k + k * n + m * n) * dt.itemsize),
         flops=2.0 * m * k * n,
         working_set_bytes=float((m * k + k * n + m * n) * dt.itemsize),
@@ -278,7 +310,10 @@ def _attention(seq: int, head_dim: int, seed: int, dev: torch.device, dt: torch.
     q = make_input(shape, seed, dev, exponent_range=0, dtype=dt)
     k = make_input(shape, seed ^ 0xA11, dev, exponent_range=0, dtype=dt)
     v = make_input(shape, seed ^ 0xB22, dev, exponent_range=0, dtype=dt)
-    ref = torch.nn.functional.scaled_dot_product_attention(q.double(), k.double(), v.double())
+    def _ref() -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(q.double(), k.double(), v.double())
+
+    ref = _ref()
     elements = batch * heads * seq * head_dim
     # QK^T and PV are each 2*b*h*s*s*d; the softmax is negligible beside them.
     flops = 4.0 * batch * heads * seq * seq * head_dim
@@ -288,6 +323,7 @@ def _attention(seq: int, head_dim: int, seed: int, dev: torch.device, dt: torch.
         out=torch.empty(shape, device=dev, dtype=dt),
         meta={"batch": batch, "heads": heads, "seq": seq, "head_dim": head_dim},
         reference=ref,
+        recompute=_ref,
         bytes_moved=float(4 * elements * dt.itemsize),  # q, k, v read; o written
         flops=flops,
         working_set_bytes=float(4 * elements * dt.itemsize),
@@ -474,12 +510,37 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int,
     if 0.0 < pilot_ms < target_sample_ms:
         inner = min(1000, int(target_sample_ms / pilot_ms) + 1)
 
+    # Move an input before every sample, so the correct answer is different every
+    # time and nothing computed earlier is still valid.
+    #
+    # Without this, a candidate could compute once and serve the result from cache
+    # for the rest of the timed calls. On a compute-bound op the roofline catches
+    # that -- a cached 4096-cubed GEMM implied 1529 TFLOP/s against an 83 TFLOP/s
+    # ceiling. On a memory-bound op it does not, because a copy moves exactly the
+    # traffic the harness charges: serving rmsnorm from cache was **admitted at
+    # 89.7% of the bus**, against 25.9% for the honest kernel it replaced.
+    #
+    # The perturbation is a scalar add, one pass over one input, outside the timed
+    # bracket so it is not charged to the kernel. It is also unpredictable in the
+    # only sense that matters: the candidate cannot know which sample is the last,
+    # and the output is checked against the reference for the final input state, so
+    # every sample has to do the work.
+    drift_key = next(iter(problem.inputs))
+    drift_tensor = problem.inputs[drift_key]
+
     if phase_fd >= 0:
         os.write(phase_fd, b"B")
 
     samples: list[float] = []
     clocks: list[float] = []
-    for _ in range(repeats):
+    for rep in range(repeats):
+        # Small relative to the data so the arithmetic stays in the same regime, and
+        # never zero, so no two samples share an answer.
+        drift_tensor.add_(DRIFT_STEP)
+        # Drain it before starting the clock. The add is a device op and without this
+        # it is still in flight when timing begins, so the kernel is charged for it --
+        # measured at about 17 percentage points of apparent bandwidth.
+        torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(inner):
             launch(problem.inputs, out, problem.meta)
@@ -501,8 +562,11 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int,
     # admitted. So the non-finite flag from this comparison is reported rather than
     # discarded, which is all it took -- it was already being computed.
     timed_written = bool(torch.isfinite(out).any().item())
+    # Against the reference for the *drifted* input, not the original: that is what
+    # makes a cached answer detectably stale.
+    timed_reference = problem.recompute()
     _, timed_rel, timed_violation, timed_nonfinite = deviation(
-        out, problem.reference, problem.rel_tol
+        out, timed_reference, problem.rel_tol
     )
 
     ordered = sorted(samples)

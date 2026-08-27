@@ -238,6 +238,17 @@ Deviation compare(const std::vector<float>& got, const std::vector<double>& want
 // Clamping loses no information the gates use: every threshold is a comparison
 // against 1.0, so 1e308 and infinity fail identically. NaN clamps to the failing
 // end deliberately, since a NaN error is not a passing one.
+// Applied to one input before every timed sample, so no answer computed earlier is
+// still correct. See driver.py for why: serving a cached result from the timed calls
+// was admitted at 89.7% of the memory bus on a memory-bound op, because a copy moves
+// exactly the traffic the harness charges and the roofline cannot tell them apart.
+constexpr float DRIFT_STEP = 0.125f;
+
+__global__ void drift_kernel(float* __restrict__ x, long long n, float step) {
+  long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+  if (i < n) x[i] += step;
+}
+
 double json_double(double v) {
   if (std::isnan(v)) return 1e308;
   if (std::isinf(v)) return v < 0.0 ? -1e308 : 1e308;
@@ -374,7 +385,12 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
     ssize_t ignored = write(phase_fd, &begin, 1);
     (void)ignored;
   }
+  const int drift_threads = 256;
+  const long long drift_blocks = ((long long)count + drift_threads - 1) / drift_threads;
   for (int i = 0; i < repeats; ++i) {
+    drift_kernel<<<(int)drift_blocks, drift_threads>>>(d_x, (long long)count, DRIFT_STEP);
+    // Drain before starting the clock, or the kernel under test is charged for it.
+    CUDA_CHECK(cudaDeviceSynchronize());
     auto t0 = std::chrono::steady_clock::now();
     for (int j = 0; j < inner; ++j) launch_candidate(d_x, d_w, d_y, rows, cols, eps, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -395,7 +411,15 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
   std::vector<float> h_y_timed(count);
   CUDA_CHECK(cudaMemcpy(h_y_timed.data(), d_y, bytes, cudaMemcpyDeviceToHost));
   bool timed_output_written = std::memcmp(h_y_timed.data(), poison.data(), bytes) != 0;
-  Deviation timed_dev = compare(h_y_timed, h_ref, op.tolerance(rows, cols));
+  // Same arithmetic the device did, in the same order and precision, so the host copy
+  // lands on identical values: `repeats` additions of DRIFT_STEP rather than one
+  // addition of repeats * DRIFT_STEP.
+  for (size_t i = 0; i < h_x.size(); ++i) {
+    for (int r = 0; r < repeats; ++r) h_x[i] += DRIFT_STEP;
+  }
+  std::vector<double> h_ref_timed(count);
+  op.reference(h_x, h_w, h_ref_timed, rows, cols, eps);
+  Deviation timed_dev = compare(h_y_timed, h_ref_timed, op.tolerance(rows, cols));
 
   std::vector<double> sorted = samples;
   for (size_t i = 1; i < sorted.size(); ++i) {
