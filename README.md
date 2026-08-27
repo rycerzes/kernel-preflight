@@ -139,13 +139,13 @@ bandwidth kernel measures against the same figure.
 
 ### The kernel matrix
 
-36 cases in one session on one GPU, with a thermal cooldown between each so the
+45 cases in one session on one GPU, with a thermal cooldown between each so the
 figures are comparable — `benchmark/full_matrix.py`. A sweep run straight after
 Helion's autotuner once read a third of the throughput of the same kernel idle,
 which is why Helion is scheduled last and why the harness samples the SM clock and
 says so when it ran below peak.
 
-**22 admitted, 14 not, and every one of the 10 adversarial candidates rejected.**
+**31 admitted, 14 not, and every one of the 11 adversarial candidates rejected.**
 
 One op, five toolchains — the comparison the gates are indifferent to, because they
 adjudicate a measurement schema rather than a toolchain:
@@ -153,25 +153,59 @@ adjudicate a measurement schema rather than a toolchain:
 | rmsnorm | fp32, % of the 1008.1 GB/s bus |
 | --- | --- |
 | TileLang | 90.5% |
-| hand-written CUDA | 89.7% |
-| Triton | 88.9% |
-| Helion (autotuned) | 88.9%, measured separately — see below |
-| CuTe DSL, block per row via shared memory | 84.6% |
-| eager PyTorch | 26.1% |
+| hand-written CUDA | 89.0% |
+| Triton | 89.0% |
+| Helion (autotuned) | 88.7% |
+| CuTe DSL, block per row via shared memory | 84.9% |
+| eager PyTorch | 26.2% |
 
-Memory-bound, other ops: CUDA softmax 89.8%, CUDA silu 91.0%, TileLang silu 90.4%,
-CuTe silu 87.9%, CUDA transpose 30.8%.
+Memory-bound, other ops: CUDA softmax 88.8%, CUDA silu 91.3%, TileLang silu 90.6%,
+CuTe silu 88.2%, CUDA transpose 30.9%.
 
 Reduced storage precision, on the backends that can honour it: Triton rmsnorm fp16
-89.5%, TileLang rmsnorm bf16 90.4%, TileLang silu fp16 90.7%, CuTe rmsnorm bf16 82.4%
-and fp16 82.2%, Triton FlashAttention fp16 88.6% of the fp16 ceiling.
+89.6%, TileLang rmsnorm bf16 90.4%, TileLang silu fp16 90.6%, CuTe rmsnorm bf16 82.4%
+and fp16 82.5%, Triton FlashAttention fp16 81.5% of the fp16 ceiling.
 
-Helion is the one figure not from this sweep, and the reason is worth stating rather
-than quietly substituting a better number. It is scheduled last because its autotuner
-runs for minutes, and in this run the contention that autotuning leaves behind failed
-its own `variance` gate. Re-measured on an idle device it passes at an interquartile
-spread of 1.06x and 88.9% of the bus. That is the gate working: the timing genuinely
-was not trustworthy at that moment, and it says so.
+### The three ops chosen because they fail
+
+The first six operations here were picked for coverage. The next three were picked from
+[KernelBenchX](https://arxiv.org/abs/2605.04956), which grades 176 tasks across 15
+categories and reports where LLM-written kernels actually break: **Fusion is the
+largest category and 72% of it fails** across every method they tested, **Quantization
+is 0 of 30**, and Math and Activation are solved consistently. This harness had the
+easy ones.
+
+| op | category | eager torch | best hand-written |
+| --- | --- | --- | --- |
+| `swiglu` — `silu(a) * b` | Fusion | 39.1% | **91.3%** TileLang |
+| `quantize` — per-row int8 round trip | Quantization | 14.0% | **88.7%** Triton |
+| `layernorm` — mean before variance | Normalization | 43.0% | **88.3%** Triton |
+
+SwiGLU across four toolchains, since fusion is where the failures concentrate:
+TileLang 91.3%, Triton 90.1%, CuTe DSL 88.3%, eager torch 39.1%. The arithmetic is five
+FLOP an element and irrelevant; the entire question is whether the kernel touches each
+input once instead of materialising the intermediate.
+
+**`quantize` could not be graded at all as first specified,** and that is the more
+interesting half of the story. With a scale of `absmax / 127` the operation is
+discontinuous, so a value within an ulp of a rounding boundary lands on a different
+integer in fp32 than in the float64 reference — 7.7% relative error on a *correct*
+kernel. No tolerance fixes it: one wide enough to admit the boundary cases also admits
+truncation, which is the error the op exists to catch.
+
+A power-of-two scale removes the ambiguity rather than tolerating it. `absmax` is exact
+because a max reduction is exact, its binary exponent is exact, and dividing by 2^k is
+an exponent shift — so the round trip is bit-exact and both candidates measure
+**violation 0.000000** against float64. Scaling by a power of two is also what several
+real quantisation schemes do, for the same reason.
+
+Two details had to be right for that to hold. The reference takes `frexp`, so the
+Triton kernel reads the IEEE-754 exponent field directly: `ceil(log2(peak))` disagrees
+at every exact power of two — `log2(2^m)` is `m` where `frexp` reports `m+1` — and can
+flip just below one when fp32 `log2` rounds up. And rounding needs `libdevice.rint` for
+round-half-even, because `tl.math` has only `floor` and `ceil` in Triton 3.7 and
+`floor(v + 0.5)` is half-up, which differs on exactly the ties a power-of-two scale
+makes reachable.
 
 Compute-bound, audited against the arithmetic ceiling rather than the bus:
 
@@ -329,8 +363,8 @@ means the supervisor owning allocation and verification too — plausibly over C
 | `src/preflight/runner.py` | isolation: container, no network, no inherited environment |
 | `src/preflight/mcp_server.py` | the three tools TrueForge sees |
 | `src/preflight/device.py` | hardware ceilings read from the CUDA driver attribute API |
-| `src/preflight/harness/examples/` | 17 honest kernels across five toolchains, 10 adversarial, 1 merely wrong — all regression tests |
-| `benchmark/full_matrix.py` | the 36-case sweep behind the table above |
+| `src/preflight/harness/examples/` | 25 honest kernels across five toolchains, 11 adversarial, 1 merely wrong — all regression tests |
+| `benchmark/full_matrix.py` | the 45-case sweep behind the table above |
 | `tests/` | 39 gate tests, including the ones that fail against the pre-fix code |
 | `agent/` | the saved TrueForge agent manifest |
 | `docker/` | the sandbox images: CUDA, plus torch/Triton/Helion/CuTe/TileLang |
