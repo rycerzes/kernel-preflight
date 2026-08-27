@@ -139,13 +139,13 @@ bandwidth kernel measures against the same figure.
 
 ### The kernel matrix
 
-52 cases in one session on one GPU, with a thermal cooldown between each so the
+67 cases in one session on one GPU, with a thermal cooldown between each so the
 figures are comparable — `benchmark/full_matrix.py`. A sweep run straight after
 Helion's autotuner once read a third of the throughput of the same kernel idle,
 which is why Helion is scheduled last and why the harness samples the SM clock and
 says so when it ran below peak.
 
-**36 admitted, 16 not, and every one of the 12 adversarial candidates rejected.**
+**51 admitted, 16 not, and every one of the 12 adversarial candidates rejected.**
 
 One op, five toolchains — the comparison the gates are indifferent to, because they
 adjudicate a measurement schema rather than a toolchain:
@@ -166,7 +166,54 @@ Reduced storage precision, on the backends that can honour it: Triton rmsnorm fp
 89.6%, TileLang silu fp16 90.6%, CuTe rmsnorm bf16 82.5% and fp16 82.4%, Triton
 FlashAttention fp16 88.3% of the fp16 ceiling.
 
-### The six ops chosen because they fail
+### Eighteen operations
+
+Best and worst admitted result per op, from one sweep. The spread within a row is the
+useful part: it is the same operation, the same reference and the same gates, so the gap
+is the kernel.
+
+| op | best | worst | what it exercises |
+| --- | --- | --- | --- |
+| `silu` | 91.2% cuda | 88.1% cute | elementwise, the control |
+| `matmul` | 91.5% triton/tf32 | 57.8% triton/fp32 | compute-bound; tf32 vs pinned ieee |
+| `swiglu` | 91.2% tilelang | 39.0% torch | Fusion — 72% of KernelBenchX's hardest category fails |
+| `rmsnorm` | 90.4% tilelang | 26.1% torch | one reduction, five toolchains |
+| `rope` | 89.7% triton | 28.9% torch | element `i` needs element `i + d/2` |
+| `attention_decode` | 92.9% triton | 19.6% torch | the only attention shape on the *memory* side |
+| `quantize` | 88.7% triton | 14.0% torch | Quantization — 0 of 30 solved in KernelBenchX |
+| `layernorm` | 88.5% triton | 42.9% torch | mean before variance |
+| `attention` | 88.5% triton/fp16 | 29.3% torch | FlashAttention forward, online softmax |
+| `softmax` | 88.8% cuda | — | numerically delicate reduction |
+| `cross_entropy` | 88.0% triton | 44.8% torch | Loss; output smaller than input |
+| `attention_gqa` | 82.7% triton/bf16 | 28.6% torch | index the shared KV head, don't expand it |
+| `gather` | 78.0% triton | 38.2% torch | Index; irregular, cannot reach peak |
+| `attention_backward` | 70.3% triton/bf16 | 11.1% triton/fp32 | dQ, dK, dV; three kernels |
+| `attention_causal` | 67.3% triton/bf16 | 21.1% torch | skip tiles, mask only the diagonal |
+| `attention_paged` | 44.8% triton | 13.4% torch | block table indirection |
+| `moe_gemm` | 32.6% triton | 21.6% torch | grouping, not arithmetic |
+| `transpose` | 31.0% cuda | — | pure movement, bit-exact |
+
+Three of those numbers are low for reasons that are the operation rather than the code,
+and having them in the set is what stops 90% reading as the pass mark. `gather` is
+irregular by construction. `moe_gemm` reads every expert's weights whichever tokens
+arrive. `attention_paged` chases a block table through a pool. A harness whose every op
+streams teaches the wrong lesson.
+
+`attention_backward` at fp32 is the one case where a hand-written kernel *loses* to
+torch — 11.1% against 22.3% — because it pins `input_precision="ieee"` and recomputes the
+scores a third time to get dQ. At bf16 it wins, 70.3%. Both are reported.
+
+### How the operations were chosen
+
+The first six were picked for coverage. The rest were not picked by taste.
+
+Six came from [KernelBenchX](https://arxiv.org/abs/2605.04956), which grades 176 tasks
+across 15 categories and reports where LLM-written kernels actually break. Six more came
+from what a serving stack runs: [FlashInfer](https://arxiv.org/pdf/2501.01005) reports
+28–30% latency reduction from fusing RoPE into attention, and paged attention, GQA and
+grouped-expert GEMM are the kernels a deployment is built on. The remaining ones —
+`attention_backward` for training, `attention_decode` for generation — cover the halves
+of attention that a single non-causal prefill kernel does not.
 
 The first six operations here were picked for coverage. The next three were picked from
 [KernelBenchX](https://arxiv.org/abs/2605.04956), which grades 176 tasks across 15
@@ -395,8 +442,8 @@ means the supervisor owning allocation and verification too — plausibly over C
 | `src/preflight/runner.py` | isolation: container, no network, no inherited environment |
 | `src/preflight/mcp_server.py` | the three tools TrueForge sees |
 | `src/preflight/device.py` | hardware ceilings read from the CUDA driver attribute API |
-| `src/preflight/harness/examples/` | 31 honest kernels across five toolchains, 12 adversarial, 1 merely wrong — all regression tests |
-| `benchmark/full_matrix.py` | the 52-case sweep behind the table above |
+| `src/preflight/harness/examples/` | 42 honest kernels across five toolchains, 12 adversarial, 1 merely wrong — all regression tests |
+| `benchmark/full_matrix.py` | the 67-case sweep behind the table above |
 | `tests/` | 39 gate tests, including the ones that fail against the pre-fix code |
 | `agent/` | the saved TrueForge agent manifest |
 | `docker/` | the sandbox images: CUDA, plus torch/Triton/Helion/CuTe/TileLang |
