@@ -270,6 +270,33 @@ def check_input_sensitivity(measurement: dict[str, Any]) -> GateResult:
     return GateResult("input_sensitivity", GateStatus.PASS, "output tracks the input at every shape")
 
 
+def _contention_note(measurement: dict[str, Any]) -> str:
+    """Whether the device looked contended while this was measured.
+
+    Exceeding the spread threshold means a whole quartile of samples ran far slower
+    than another quartile, which is not one scheduler hiccup -- it is either an
+    unstable kernel or a device that was busy for the duration. The report cannot
+    tell those apart on the ratio alone, and they call for opposite responses: one
+    is "re-run this", the other is "rewrite this".
+
+    The clock the harness sampled during the run separates them cheaply. Measured
+    over 28 runs of one honest kernel, the spread stayed within 1.13x at every
+    repeat count between 5 and 50, so a reading past 1.5 is unusual enough to be
+    worth explaining rather than just reporting.
+    """
+    observed = [s["sm_clock_hz_observed"] for s in measurement["shapes"] if s.get("sm_clock_hz_observed")]
+    peak = measurement.get("sm_clock_hz")
+    if not observed or not peak:
+        return ""
+    ratio = (sum(observed) / len(observed)) / float(peak)
+    if ratio < 0.9:
+        return (
+            f". The device ran at {ratio:.0%} of peak clock during this measurement, so it "
+            f"was throttled or contended -- re-run on an idle device before changing the kernel"
+        )
+    return ". The device held {:.0%} of peak clock throughout, so this is the kernel rather than the machine".format(ratio)
+
+
 def check_variance(measurement: dict[str, Any]) -> GateResult:
     worst_ratio = 0.0
     worst_shape = ""
@@ -284,7 +311,8 @@ def check_variance(measurement: dict[str, Any]) -> GateResult:
             "variance",
             GateStatus.FAIL,
             f"interquartile spread is {worst_ratio:.2f}x at {worst_shape}; half the samples "
-            f"disagree by that much, so the median does not summarise this kernel",
+            f"disagree by that much, so the median does not summarise this kernel"
+            f"{_contention_note(measurement)}",
         )
     spikes = sum(int(s.get("outliers", 0)) for s in measurement["shapes"])
     note = f"; {spikes} sample(s) above 2x median, not counted against it" if spikes else ""

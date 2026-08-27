@@ -199,11 +199,35 @@ as forgetting to restart the MCP server, and the same fix: purge on sync.
 ## Known flakiness
 
 The variance gate asks whether a kernel's own median means anything, and it has
-been retuned twice for exactly this. It compared max/min, then p90/median — which
-at `repeats=10` indexes the last sample, so p90 *was* max and honest kernels were
-rejected — and now compares **p75/p25 against 1.5**, which is unmoved by a handful
-of spikes by construction. Combined with batched timing, an eighteen-case sweep no
-longer trips it.
+been retuned twice for exactly this. It compared max/min, then p90/median -- which at
+`repeats=10` indexes the last sample, so p90 *was* max and honest kernels were
+rejected -- and now compares **p75/p25 against 1.5**, which is unmoved by a handful of
+spikes by construction.
+
+Measured, rather than assumed: 28 runs of one honest kernel across
+`repeats` in {5, 8, 10, 15, 20, 30, 50}, four trials each
+(`benchmark/variance_study.py`):
+
+| repeats | worst p75/p25 | median | rejections |
+| --- | --- | --- | --- |
+| 5 | 1.063 | 1.053 | 0/4 |
+| 8 | 1.129 | 1.061 | 0/4 |
+| 10 | 1.085 | 1.073 | 0/4 |
+| 15 | 1.076 | 1.061 | 0/4 |
+| 20 | 1.058 | 1.049 | 0/4 |
+| 30 | 1.057 | 1.039 | 0/4 |
+| 50 | 1.106 | 1.061 | 0/4 |
+
+Worst across all 28 runs is 1.129, so the threshold has ~1.3x of headroom and the
+statistic does not degrade at low repeat counts the way p90/median did.
+
+One rejection of that same kernel was observed outside this study, at `repeats=15`.
+Exceeding 1.5 means an entire quartile ran more than 1.5x slower than another
+quartile, which is not one spike -- it is the device being genuinely contended for the
+duration. On that reading the gate was right and the measurement was untrustworthy at
+that moment, so the remedy is to re-run rather than to loosen the bar. What the report
+does not yet say is *which* of those it was, so a reader cannot tell "re-run this" from
+"fix your kernel" without looking at the clock samples themselves.
 
 What is still not implemented is the harder statistical question. The gate decides
 whether to *admit* one kernel; it does not decide whether one kernel is faster than
