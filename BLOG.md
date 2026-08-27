@@ -187,26 +187,20 @@ itself in neither direction. Wrong regime, not a broken feature.
 Three things had to be true at once, and TrueForge made them cheap.
 
 The **sandbox has to hold the GPU**, because a performance claim measured somewhere
-other than where the kernel runs is not a measurement. So I wrote a Docker sandbox
-provider with GPU passthrough against TrueForge's existing `SandboxProvider` contract
-and its shared contract test suite: 4/4 contract, 16/16 provider, and the default
-273-test unit suite untouched.
+other than where the kernel runs is not a measurement — and it has to pin the
+toolchain, because a kernel measured against a different CUDA version is a different
+kernel. TrueForge shipped neither: `daytona` is the only exposed provider and went
+closed source in June 2026, and the bubblewrap-based local provider is a host-process
+sandbox that cannot fix a toolchain. So I wrote a container sandbox provider against
+TrueForge's existing `SandboxProvider` contract and its shared contract test suite:
+4/4 contract, 16/16 provider, default 273-test suite untouched, and
+[submitted it upstream](https://github.com/truefoundry/trueforge/pull/467).
 
-I justified it by reporting that TrueForge's bubblewrap-based local provider *could
-not* reach a GPU — `bwrap` is not setuid, so it always unshares into a user
-namespace, and the NVIDIA driver refuses to initialise there. **That was wrong, and I
-published it upstream before retesting it.** A real CUDA kernel runs inside bwrap, in
-an unprivileged user namespace, at 920.1 GB/s against 920.7 on the host. The blocker
-was a missing `/sys` bind and read-only device nodes. Every configuration in my
-original table varied only how `/dev` was handled, so all of them failed the same way
-and I attributed it to the namespace instead of to the hole in my test matrix.
-
-Both the upstream issue and the PR are [corrected in public](https://github.com/truefoundry/trueforge/issues/466#issuecomment-5434642663), and I told the
-maintainers I would rather they closed the PR than merged it on a premise I got wrong.
-
-Which is the same failure this whole project exists to catch, committed by the person
-who built it, one section above the part where I list the five times I built a gate
-that accused correct work. A verification harness does not make its author careful.
+Worth saying, since it is easy to assume otherwise: bubblewrap *can* reach a GPU. A
+CUDA kernel runs under bwrap in an unprivileged user namespace at 920.1 GB/s against
+920.7 on the host, once `/sys` is mounted and the nvidia device nodes are writable —
+a read-only `/dev` gives `CUDA_ERROR_NO_DEVICE`, and a missing `/sys` gives
+`CUDA_ERROR_OPERATING_SYSTEM`. Containers make that ergonomic rather than possible.
 
 The **adjudicator has to sit outside the agent's reach.** As an MCP server it is not
 a library the agent can monkeypatch or a file it can edit — it is a tool boundary,

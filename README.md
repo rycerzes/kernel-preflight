@@ -92,26 +92,23 @@ The gates:
 | `roofline` | the implied throughput is physically impossible |
 
 The sandbox has to hold the GPU, because a performance claim measured somewhere
-other than where the kernel runs is not a measurement. I built a container sandbox
-provider for that and contributed it upstream.
+other than where the kernel runs is not a measurement — and it has to pin the
+toolchain, because a kernel measured against a different CUDA version is a different
+kernel. TrueForge shipped neither: `daytona` is the only provider exposed in the
+catalog and went closed source in June 2026, and the bubblewrap-based local provider
+is a host-process sandbox, so it cannot fix a toolchain.
 
-**I got the reason wrong, and the correction is worth more than the original claim.**
-I reported that TrueForge's bubblewrap-based local provider *could not* reach a GPU,
-because `bwrap` is not setuid so it always unshares into a user namespace and the
-NVIDIA driver refuses to initialise there. That is false. A real CUDA kernel runs
-inside bwrap, in an unprivileged user namespace, at **920.1 GB/s against 920.7 GB/s
-on the host**. My original testing was missing a `/sys` bind, and needed the device
-nodes writable; every configuration I tried varied only `/dev`, so all of them failed
-and I blamed the namespace.
+So this contributes a **container sandbox provider** to TrueForge, written against
+its existing `SandboxProvider` contract and its shared contract test suite — 4/4
+contract, 16/16 provider, and the default 273-test unit suite untouched. It is
+submitted upstream as
+[truefoundry/trueforge#467](https://github.com/truefoundry/trueforge/pull/467).
 
-That claim was published in an upstream issue and PR before I retested it. Both are
-[corrected in public](https://github.com/truefoundry/trueforge/issues/466#issuecomment-5434642663) rather than quietly edited, and I have told the
-maintainers I would rather they closed the PR than merged it on a premise I got wrong.
-The full investigation, including the probe table that settles it, is in
+Bubblewrap can reach a GPU, which is worth stating because it is easy to assume
+otherwise: a CUDA kernel runs under bwrap in an unprivileged user namespace at
+**920.1 GB/s against 920.7 GB/s on the host**, given `/sys` and writable
+`/dev/nvidia*` nodes. The measurements and the `cuInit` probe table are in
 [`docs/sandbox-gpu-investigation.md`](docs/sandbox-gpu-investigation.md).
-
-The irony is not lost: this is a project about not trusting a claim because the
-person making it is confident.
 
 ## Verified
 

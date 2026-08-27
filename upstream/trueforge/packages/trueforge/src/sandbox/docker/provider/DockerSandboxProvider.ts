@@ -11,11 +11,10 @@
  *    absolute path. Separate containers satisfy that structurally: the sibling
  *    path does not exist in the other mount namespace.
  *
- * `gpus` maps onto `--gpus`, so the container toolkit does the device and driver
- * plumbing. This is convenience rather than exclusive capability: bubblewrap can
- * reach a GPU too, given `/sys` and writable `/dev/nvidia*` nodes, and an earlier
- * version of this comment claimed otherwise on the strength of a test matrix that
- * never varied `/sys`. See truefoundry/trueforge#466.
+ * The sandbox is an image, which is the point: a workload that needs a specific
+ * CUDA or Python toolchain gets a reproducible one, which a host-process sandbox
+ * cannot offer. `gpus` maps onto `--gpus` so the container toolkit does the device
+ * and driver plumbing.
  *
  * File transfer goes through `docker exec` with a piped stdin/stdout rather than
  * encoding payloads into a command string. Encoding into argv caps out around
