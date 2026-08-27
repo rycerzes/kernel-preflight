@@ -116,11 +116,6 @@ def make_input(
 # ---------------------------------------------------------------------------
 
 
-# Added to one input before each timed sample so no cached answer stays correct.
-# Small enough not to change the numerical regime, large enough to exceed any
-# tolerance the gates apply.
-DRIFT_STEP = 0.125
-
 FP32_EPS = 1.1920929e-07
 
 
@@ -510,23 +505,28 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int,
     if 0.0 < pilot_ms < target_sample_ms:
         inner = min(1000, int(target_sample_ms / pilot_ms) + 1)
 
-    # Move an input before every sample, so the correct answer is different every
-    # time and nothing computed earlier is still valid.
+    # Rotate an input by one element before every sample, so the correct answer is
+    # different every time and nothing computed earlier is still valid.
     #
-    # Without this, a candidate could compute once and serve the result from cache
-    # for the rest of the timed calls. On a compute-bound op the roofline catches
-    # that -- a cached 4096-cubed GEMM implied 1529 TFLOP/s against an 83 TFLOP/s
-    # ceiling. On a memory-bound op it does not, because a copy moves exactly the
-    # traffic the harness charges: serving rmsnorm from cache was **admitted at
-    # 89.7% of the bus**, against 25.9% for the honest kernel it replaced.
+    # Without this, a candidate could compute once and serve the result from cache for
+    # the rest of the timed calls. On a compute-bound op the roofline catches that -- a
+    # cached 4096-cubed GEMM implied 1529 TFLOP/s against an 83 TFLOP/s ceiling. On a
+    # memory-bound op it does not, because a copy moves exactly the traffic the harness
+    # charges: serving rmsnorm from cache was admitted at 89.7% of the bus, against
+    # 25.9% for the honest kernel it replaced.
     #
-    # The perturbation is a scalar add, one pass over one input, outside the timed
-    # bracket so it is not charged to the kernel. It is also unpredictable in the
-    # only sense that matters: the candidate cannot know which sample is the last,
-    # and the output is checked against the reference for the final input state, so
-    # every sample has to do the work.
+    # A rotation rather than an offset, and that distinction cost a false rejection to
+    # find. Adding a constant shifts the value distribution, which for attention moves
+    # the softmax into a more saturated regime: it raised the measured error 1.7x and
+    # failed a correct TF32 FlashAttention kernel that had been passing at 0.78 of its
+    # bar. A rotation is a permutation, so every output value changes while the
+    # distribution is exactly preserved and no tolerance has to be renegotiated.
+    #
+    # One pass, outside the timed bracket. The candidate cannot know which sample is
+    # the last, and the output is checked against the reference for the final input
+    # state, so every sample has to do the work.
     drift_key = next(iter(problem.inputs))
-    drift_tensor = problem.inputs[drift_key]
+    drift_flat = problem.inputs[drift_key].view(-1)
 
     if phase_fd >= 0:
         os.write(phase_fd, b"B")
@@ -534,12 +534,10 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int,
     samples: list[float] = []
     clocks: list[float] = []
     for rep in range(repeats):
-        # Small relative to the data so the arithmetic stays in the same regime, and
-        # never zero, so no two samples share an answer.
-        drift_tensor.add_(DRIFT_STEP)
-        # Drain it before starting the clock. The add is a device op and without this
-        # it is still in flight when timing begins, so the kernel is charged for it --
-        # measured at about 17 percentage points of apparent bandwidth.
+        drift_flat.copy_(torch.roll(drift_flat, 1))
+        # Drain it before starting the clock. The rotation is a device op and without
+        # this it is still in flight when timing begins, so the kernel is charged for
+        # it -- measured at about 17 percentage points of apparent bandwidth.
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(inner):

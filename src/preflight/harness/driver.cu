@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <limits>
 #include <vector>
 #include <chrono>
@@ -238,15 +239,20 @@ Deviation compare(const std::vector<float>& got, const std::vector<double>& want
 // Clamping loses no information the gates use: every threshold is a comparison
 // against 1.0, so 1e308 and infinity fail identically. NaN clamps to the failing
 // end deliberately, since a NaN error is not a passing one.
-// Applied to one input before every timed sample, so no answer computed earlier is
-// still correct. See driver.py for why: serving a cached result from the timed calls
-// was admitted at 89.7% of the memory bus on a memory-bound op, because a copy moves
-// exactly the traffic the harness charges and the roofline cannot tell them apart.
-constexpr float DRIFT_STEP = 0.125f;
-
-__global__ void drift_kernel(float* __restrict__ x, long long n, float step) {
+// Rotates one input by a single element before every timed sample, so no answer
+// computed earlier is still correct. See driver.py for why this exists: serving a
+// cached result from the timed calls was admitted at 89.7% of the memory bus on a
+// memory-bound op, because a copy moves exactly the traffic the harness charges and
+// the roofline cannot tell them apart.
+//
+// A rotation rather than an offset: adding a constant shifts the value distribution,
+// which pushed attention's softmax into a more saturated regime and failed a correct
+// TF32 kernel. A permutation changes every output while preserving the distribution
+// exactly.
+__global__ void rotate_kernel(const float* __restrict__ src, float* __restrict__ dst,
+                              long long n) {
   long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-  if (i < n) x[i] += step;
+  if (i < n) dst[(i + 1) % n] = src[i];
 }
 
 double json_double(double v) {
@@ -385,10 +391,13 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
     ssize_t ignored = write(phase_fd, &begin, 1);
     (void)ignored;
   }
-  const int drift_threads = 256;
-  const long long drift_blocks = ((long long)count + drift_threads - 1) / drift_threads;
+  const int rot_threads = 256;
+  const long long rot_blocks = ((long long)count + rot_threads - 1) / rot_threads;
+  float* d_rot = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_rot, bytes));
   for (int i = 0; i < repeats; ++i) {
-    drift_kernel<<<(int)drift_blocks, drift_threads>>>(d_x, (long long)count, DRIFT_STEP);
+    rotate_kernel<<<(int)rot_blocks, rot_threads>>>(d_x, d_rot, (long long)count);
+    CUDA_CHECK(cudaMemcpy(d_x, d_rot, bytes, cudaMemcpyDeviceToDevice));
     // Drain before starting the clock, or the kernel under test is charged for it.
     CUDA_CHECK(cudaDeviceSynchronize());
     auto t0 = std::chrono::steady_clock::now();
@@ -411,11 +420,12 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
   std::vector<float> h_y_timed(count);
   CUDA_CHECK(cudaMemcpy(h_y_timed.data(), d_y, bytes, cudaMemcpyDeviceToHost));
   bool timed_output_written = std::memcmp(h_y_timed.data(), poison.data(), bytes) != 0;
-  // Same arithmetic the device did, in the same order and precision, so the host copy
-  // lands on identical values: `repeats` additions of DRIFT_STEP rather than one
-  // addition of repeats * DRIFT_STEP.
-  for (size_t i = 0; i < h_x.size(); ++i) {
-    for (int r = 0; r < repeats; ++r) h_x[i] += DRIFT_STEP;
+  CUDA_CHECK(cudaFree(d_rot));
+  // The same permutation the device applied: `repeats` single-element rotations to the
+  // right. A rotation is exact, so host and device agree bit for bit.
+  {
+    const size_t shift = static_cast<size_t>(repeats) % h_x.size();
+    std::rotate(h_x.rbegin(), h_x.rbegin() + static_cast<long>(shift), h_x.rend());
   }
   std::vector<double> h_ref_timed(count);
   op.reference(h_x, h_w, h_ref_timed, rows, cols, eps);
