@@ -139,13 +139,13 @@ bandwidth kernel measures against the same figure.
 
 ### The kernel matrix
 
-45 cases in one session on one GPU, with a thermal cooldown between each so the
+52 cases in one session on one GPU, with a thermal cooldown between each so the
 figures are comparable — `benchmark/full_matrix.py`. A sweep run straight after
 Helion's autotuner once read a third of the throughput of the same kernel idle,
 which is why Helion is scheduled last and why the harness samples the SM clock and
 says so when it ran below peak.
 
-**31 admitted, 14 not, and every one of the 11 adversarial candidates rejected.**
+**36 admitted, 16 not, and every one of the 12 adversarial candidates rejected.**
 
 One op, five toolchains — the comparison the gates are indifferent to, because they
 adjudicate a measurement schema rather than a toolchain:
@@ -153,20 +153,20 @@ adjudicate a measurement schema rather than a toolchain:
 | rmsnorm | fp32, % of the 1008.1 GB/s bus |
 | --- | --- |
 | TileLang | 90.5% |
-| hand-written CUDA | 89.0% |
+| hand-written CUDA | 89.7% |
 | Triton | 89.0% |
 | Helion (autotuned) | 88.7% |
 | CuTe DSL, block per row via shared memory | 84.9% |
-| eager PyTorch | 26.2% |
+| eager PyTorch | 26.1% |
 
-Memory-bound, other ops: CUDA softmax 88.8%, CUDA silu 91.3%, TileLang silu 90.6%,
-CuTe silu 88.2%, CUDA transpose 30.9%.
+Memory-bound, other ops: CUDA silu 91.2%, CUDA softmax 88.9%, TileLang silu 90.5%,
+CuTe silu 88.1%, CUDA transpose 30.9%.
 
 Reduced storage precision, on the backends that can honour it: Triton rmsnorm fp16
-89.6%, TileLang rmsnorm bf16 90.4%, TileLang silu fp16 90.6%, CuTe rmsnorm bf16 82.4%
-and fp16 82.5%, Triton FlashAttention fp16 81.5% of the fp16 ceiling.
+89.6%, TileLang silu fp16 90.6%, CuTe rmsnorm bf16 82.5% and fp16 82.4%, Triton
+FlashAttention fp16 88.3% of the fp16 ceiling.
 
-### The three ops chosen because they fail
+### The six ops chosen because they fail
 
 The first six operations here were picked for coverage. The next three were picked from
 [KernelBenchX](https://arxiv.org/abs/2605.04956), which grades 176 tasks across 15
@@ -177,14 +177,37 @@ easy ones.
 
 | op | category | eager torch | best hand-written |
 | --- | --- | --- | --- |
-| `swiglu` — `silu(a) * b` | Fusion | 39.1% | **91.3%** TileLang |
-| `quantize` — per-row int8 round trip | Quantization | 14.0% | **88.7%** Triton |
-| `layernorm` — mean before variance | Normalization | 43.0% | **88.3%** Triton |
+| `swiglu` — `silu(a) * b` | Fusion (72% fail) | 39.0% | **91.4%** TileLang |
+| `quantize` — per-row int8 round trip | Quantization (0/30) | 14.0% | **88.7%** Triton |
+| `rope` — split-half rotary embedding | — | 28.8% | **89.7%** Triton |
+| `cross_entropy` — one loss per row | Loss | 44.8% | **88.1%** Triton |
+| `layernorm` — mean before variance | Normalization | 42.9% | **88.4%** Triton |
+| `gather` — `table[idx]` | Index | 38.1% | **78.0%** Triton |
 
-SwiGLU across four toolchains, since fusion is where the failures concentrate:
-TileLang 91.3%, Triton 90.1%, CuTe DSL 88.3%, eager torch 39.1%. The arithmetic is five
-FLOP an element and irrelevant; the entire question is whether the kernel touches each
-input once instead of materialising the intermediate.
+RoPE is not from that taxonomy. It is here because essentially every deployed
+transformer runs it and because fusing it with attention is where inference engines find
+their wins — [FlashInfer](https://arxiv.org/pdf/2501.01005) reports 28–30% latency
+reduction from exactly that fusion. Structurally it is the odd one out: output element
+`i` depends on input element `i + d/2`, so the row cannot be split into independent
+tiles the way an elementwise kernel can.
+
+SwiGLU across four toolchains, since fusion is where the failures concentrate: TileLang
+91.4%, Triton 90.2%, CuTe DSL 88.4%, eager torch 39.0%. The arithmetic is five FLOP an
+element and irrelevant; the entire question is whether the kernel touches each input
+once instead of materialising the intermediate.
+
+**`gather` is the one op here that should not reach 90%, and that is the point of
+including it.** Its access pattern is irregular — 512-byte rows fetched from
+unpredictable places — so the achievable fraction of peak is set by the pattern rather
+than by the code. Triton reaches 78.0% and torch 38.1%; neither is a bad kernel. Every
+other op in the set streams, and without one that cannot, 90% quietly becomes the pass
+mark.
+
+It also caught an error in its own cost model, which is the roofline gate working on
+me rather than on a candidate. Indices are drawn with replacement, so about 1 − 1/e of
+the rows are distinct and the rest are cache hits. Charging for all of them overstated
+the traffic by a fifth, and a correct Triton kernel came out at **95.5% of the bus** —
+refused as pointing at the measurement rather than the kernel. It was right.
 
 **`quantize` could not be graded at all as first specified,** and that is the more
 interesting half of the story. With a scale of `absmax / 127` the operation is
@@ -320,6 +343,15 @@ moment is not writing a new check, it is changing what the harness feeds the ker
 | a kernel at a third of its throughput | measured after 900 s of autotuning, against a ceiling that assumes peak clock |
 | a correct TF32 FlashAttention kernel | the fix above first offset the input by a constant, which shifted the softmax into a more saturated regime and raised the error 1.7x |
 
+And one claim withdrawn rather than a gate fixed. I wrote that `cross_entropy` without
+the row-max subtraction overflows, added an adversarial candidate for it, and the
+harness admitted that candidate — correctly. Measured: logits span ±80, the largest row
+sum of exponentials is 4.3e35, fp32 holds 3.4e38. Nothing overflows, so the unstable
+kernel's answer is right and the docstrings claiming otherwise were wrong. What does
+break is the *scope* of the reduction: `cheat_blockwise_cross_entropy.py` shifts each
+tile by that tile's own maximum and adds the partials without rescaling, which gives no
+NaN, the right sign, a plausible magnitude, and an answer wrong by 227× tolerance.
+
 ### The limit this does not clear
 
 Two candidates in `examples/` forged the entire measurement and were admitted at
@@ -363,8 +395,8 @@ means the supervisor owning allocation and verification too — plausibly over C
 | `src/preflight/runner.py` | isolation: container, no network, no inherited environment |
 | `src/preflight/mcp_server.py` | the three tools TrueForge sees |
 | `src/preflight/device.py` | hardware ceilings read from the CUDA driver attribute API |
-| `src/preflight/harness/examples/` | 25 honest kernels across five toolchains, 11 adversarial, 1 merely wrong — all regression tests |
-| `benchmark/full_matrix.py` | the 45-case sweep behind the table above |
+| `src/preflight/harness/examples/` | 31 honest kernels across five toolchains, 12 adversarial, 1 merely wrong — all regression tests |
+| `benchmark/full_matrix.py` | the 52-case sweep behind the table above |
 | `tests/` | 39 gate tests, including the ones that fail against the pre-fix code |
 | `agent/` | the saved TrueForge agent manifest |
 | `docker/` | the sandbox images: CUDA, plus torch/Triton/Helion/CuTe/TileLang |
