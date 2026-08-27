@@ -46,6 +46,8 @@ CASES = [
     ("triton_layernorm.py",           "layernorm", "triton",   "fp32", "one pass, mean and variance together"),
     ("torch_swiglu.py",               "swiglu",    "torch",    "fp32", "unfused, materialises the intermediate"),
     ("triton_swiglu.py",              "swiglu",    "triton",   "fp32", "fused, one pass per input"),
+    ("tilelang_swiglu.py",            "swiglu",    "tilelang", "fp32", "fused, TileLang"),
+    ("cute_swiglu.py",                "swiglu",    "cute",     "fp32", "fused, CuTe DSL"),
     ("torch_quantize.py",             "quantize",  "torch",    "fp32", "unfused int8 round trip"),
     ("triton_quantize.py",            "quantize",  "triton",   "fp32", "exponent from the float bits"),
     # --- Wrong, but not dishonest. Must fail on correctness with a readable reason.
