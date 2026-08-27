@@ -70,7 +70,12 @@ def device_spec() -> dict[str, Any]:
         "(inputs a, b; silu(a) * b, a fusion where the win is touching each input "
         "once), and quantize (input x; per-row symmetric int8 round trip with a "
         "power-of-two scale, so the correct answer is bit-exact -- derive the scale, "
-        "round to nearest even, clamp, scale back)."
+        "round to nearest even, clamp, scale back), rope (inputs x, cos, sin; "
+        "split-half rotary embedding, where output element i depends on element "
+        "i + d/2 so the row cannot be tiled independently), gather (inputs table, "
+        "idx; out[i] = table[idx[i]], irregular access that cannot reach peak "
+        "bandwidth at any quality), and cross_entropy (inputs logits, target; one "
+        "unreduced loss per row, so the output is smaller than the input)."
     ),
 )
 def preflight_kernel(
@@ -79,8 +84,8 @@ def preflight_kernel(
         str,
         Field(
             description="Operation to measure: rmsnorm, softmax, silu or transpose on any "
-            "backend; matmul, attention, layernorm, swiglu and quantize on the Python "
-            "backends only."
+            "backend; matmul, attention, layernorm, swiglu, quantize, rope, gather and "
+            "cross_entropy on the Python backends only."
         ),
     ] = "rmsnorm",
     arch: Annotated[str, Field(description="Target architecture, e.g. sm_89.")] = "sm_89",

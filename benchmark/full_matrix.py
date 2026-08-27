@@ -50,6 +50,15 @@ CASES = [
     ("cute_swiglu.py",                "swiglu",    "cute",     "fp32", "fused, CuTe DSL"),
     ("torch_quantize.py",             "quantize",  "torch",    "fp32", "unfused int8 round trip"),
     ("triton_quantize.py",            "quantize",  "triton",   "fp32", "exponent from the float bits"),
+    # --- Index and Loss from the same taxonomy, plus RoPE because every deployed
+    # --- transformer runs it and fusing it with attention is where the inference
+    # --- engines find their wins.
+    ("torch_rope.py",                 "rope",          "torch",  "fp32", "slices and a concatenate"),
+    ("triton_rope.py",                "rope",          "triton", "fp32", "both halves in one program"),
+    ("torch_gather.py",               "gather",        "torch",  "fp32", "index_select"),
+    ("triton_gather.py",              "gather",        "triton", "fp32", "one program per gathered row"),
+    ("torch_cross_entropy.py",        "cross_entropy", "torch",  "fp32", "torch's fused loss"),
+    ("triton_cross_entropy.py",       "cross_entropy", "triton", "fp32", "two passes, row-wide shift"),
     # --- Wrong, but not dishonest. Must fail on correctness with a readable reason.
     ("wrong_transpose.cu",            "transpose", "cuda",     "fp32", "off by one row"),
     # --- Adversarial. Every one of these must be rejected.
@@ -64,6 +73,7 @@ CASES = [
     ("cheat_pay_the_clock.py",        "matmul",    "torch",    "fp32", "cached answer, caught on the compute axis"),
     ("cheat_cached_timed.py",         "rmsnorm",   "torch",    "fp32", "cached answer, memory-bound: needs the input drift"),
     ("cheat_truncating_quantize.py",  "quantize",  "torch",    "fp32", "truncates instead of rounding"),
+    ("cheat_blockwise_cross_entropy.py", "cross_entropy", "torch", "fp32", "per-tile max, partials not rescaled"),
     # --- Reduced storage precision, on the backends that can honour it.
     ("triton_rmsnorm.py",             "rmsnorm",   "triton",   "fp16", "fp16 storage"),
     ("tilelang_rmsnorm.py",           "rmsnorm",   "tilelang", "bf16", "bf16 storage"),

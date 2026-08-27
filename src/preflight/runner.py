@@ -56,6 +56,10 @@ PYTHON_OPS = (
     # The two categories KernelBenchX finds hardest: Fusion (72% failure) and
     # Quantization (0 of 30 solved), plus LayerNorm for its two-stage reduction.
     "layernorm", "swiglu", "quantize",
+    # Index and Loss from the same taxonomy, plus RoPE because essentially every
+    # deployed transformer runs it and fusing it with attention is where the
+    # inference engines find their wins.
+    "rope", "gather", "cross_entropy",
 )
 PYTHON_BACKENDS = ("triton", "helion", "torch", "cute", "tilelang")
 SUPPORTED_BACKENDS = ("cuda", *PYTHON_BACKENDS)

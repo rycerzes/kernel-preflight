@@ -472,6 +472,160 @@ def _attention(seq: int, head_dim: int, seed: int, dev: torch.device, dt: torch.
     )
 
 
+def _rope(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """Rotary position embedding, the split-half convention Llama and GPT-NeoX use.
+
+    Chosen because it is one of the few kernels essentially every deployed transformer
+    runs, and because fusing it with attention is where real inference engines find
+    their wins -- FlashInfer reports 28-30% latency reduction from exactly that fusion.
+
+    Elementwise in traffic but not in structure: output element `i` depends on element
+    `i + d/2`, so a kernel cannot process the row in independent chunks the way silu
+    can. That coupling across half the row is the whole difficulty, and it is why a
+    naive port of an elementwise kernel produces plausible-looking garbage.
+
+    `cos` and `sin` are supplied rather than computed, which is what an inference engine
+    does -- they depend only on position and are cached across the whole forward pass.
+    """
+    half = cols // 2
+    x = make_input((rows, cols), seed, dev, dtype=dt)
+    # Real angles, so cos and sin are correlated the way they are in practice rather
+    # than being two unrelated random tensors.
+    gen = torch.Generator(device=dev).manual_seed(seed ^ 0xC0DE)
+    angle = torch.rand((rows, half), generator=gen, device=dev, dtype=torch.float32) * 6.2831853
+    cos = angle.cos().to(dt)
+    sin = angle.sin().to(dt)
+
+    def _ref() -> torch.Tensor:
+        xd, cd, sd = x.double(), cos.double(), sin.double()
+        lo, hi = xd[:, :half], xd[:, half:]
+        return torch.cat((lo * cd - hi * sd, hi * cd + lo * sd), dim=-1)
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"x": x, "cos": cos, "sin": sin},
+        out=torch.empty_like(x),
+        meta={"rows": rows, "cols": cols, "half": half},
+        reference=ref,
+        recompute=_ref,
+        # x and out in full, cos and sin are half a row each.
+        bytes_moved=3.0 * n * dt.itemsize,
+        flops=6.0 * n,
+        working_set_bytes=3.0 * n * dt.itemsize,
+        rel_tol=accumulation_tolerance(1, dt=dt),
+    )
+
+
+def _gather(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """Row gather: out[i] = table[idx[i]]. Embedding lookup, KV-cache reads, MoE routing.
+
+    KernelBenchX's Index category, which it describes as dominated by address
+    calculation rather than arithmetic, and the access pattern behind three of the
+    hottest kernels in inference serving.
+
+    Interesting for the harness rather than only for the kernel. Every other op here
+    streams, so peak bandwidth is a reachable target and 90% means a good kernel. A
+    random gather cannot reach it at any quality: rows are 512 bytes here, so each one
+    is four sectors fetched from an unpredictable place, and the achievable fraction of
+    peak is set by the access pattern, not by the code. The number this op produces is
+    therefore low for an honest kernel, and that is the correct answer -- which is worth
+    having in the set precisely because it stops 90% being read as the pass mark.
+
+    `bytes_moved` counts the compulsory traffic: the *distinct* rows touched, once each,
+    plus the write. Not what the memory system really moves, which is higher, because
+    the harness should charge an op for the work it requires rather than for the
+    hardware's granularity.
+
+    Counting the distinct rows is not a refinement, it is the difference between this op
+    being gradable and not. Indices are drawn with replacement, so about 1 - 1/e of the
+    rows are distinct and the rest are repeats that the cache serves. Charging for all
+    of them overstated the traffic by a fifth, and a correct Triton kernel came out at
+    **95.5% of the memory bus** -- refused by the roofline gate as pointing at the
+    measurement rather than the kernel. Which it did: the kernel was fine and the cost
+    model was wrong.
+    """
+    table = make_input((rows, cols), seed, dev, dtype=dt)
+    gen = torch.Generator(device=dev).manual_seed(seed ^ 0x1DEA)
+    # With replacement, so the pattern is irregular *and* has repeats, which is what an
+    # embedding lookup or MoE route actually looks like.
+    idx = torch.randint(0, rows, (rows,), generator=gen, device=dev, dtype=torch.int64)
+    distinct = int(torch.unique(idx).numel())
+
+    def _ref() -> torch.Tensor:
+        return table.double()[idx]
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"table": table, "idx": idx},
+        out=torch.empty_like(table),
+        meta={"rows": rows, "cols": cols},
+        reference=ref,
+        recompute=_ref,
+        # Distinct rows read once, every row written.
+        bytes_moved=float((distinct + rows) * cols * dt.itemsize),
+        flops=0.0,
+        working_set_bytes=float((distinct + rows) * cols * dt.itemsize),
+        # A gather moves data without touching it: bit-exact, like transpose.
+        rel_tol=0.0,
+    )
+
+
+def _cross_entropy(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """Per-row cross entropy from logits, unreduced. KernelBenchX's Loss category.
+
+    The one op here whose output is smaller than its input: a row of `cols` logits
+    collapses to a single number, so there is nowhere for an error to average out. A
+    softmax that drifts slightly is still a plausible softmax; a loss that drifts is
+    the training signal.
+
+    A note on the max subtraction, because the obvious claim about it is false here and
+    it was worth measuring rather than asserting. Every real implementation shifts by
+    the row maximum before exponentiating, and the usual justification is overflow --
+    but at this input range it does not overflow: logits span +/-80, the largest row sum
+    of exponentials is 4.3e35, and fp32 holds up to 3.4e38. A kernel that skips the
+    shift is admitted here, correctly, because its answer is right.
+
+    What does break is the *scope* of the reduction, which is what KernelBenchX reports
+    for its Reduce category: a kernel that shifts each tile by that tile's own maximum
+    and then adds the partial sums is combining quantities scaled differently, and the
+    result is wrong by a factor nothing in the code looks suspicious about. That is what
+    `cheat_blockwise_cross_entropy.py` does.
+
+    The output is one number a row, which is the reason this op is here at all. A
+    softmax that drifts slightly is still a plausible softmax; a loss that drifts is the
+    training signal, and there is no averaging left to hide it in.
+    """
+    logits = make_input((rows, cols), seed, dev, dtype=dt)
+    gen = torch.Generator(device=dev).manual_seed(seed ^ 0x105E)
+    target = torch.randint(0, cols, (rows,), generator=gen, device=dev, dtype=torch.int64)
+
+    def _ref() -> torch.Tensor:
+        ld = logits.double()
+        return torch.nn.functional.cross_entropy(ld, target, reduction="none")
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"logits": logits, "target": target},
+        # One loss per row, in the accumulation precision rather than the storage one:
+        # a bf16 scalar loss would quantise the answer below any useful tolerance.
+        out=torch.empty((rows,), device=dev, dtype=torch.float32),
+        meta={"rows": rows, "cols": cols},
+        reference=ref,
+        recompute=_ref,
+        # Logits read; the output is one float a row, which rounds to nothing beside it.
+        bytes_moved=float(n * dt.itemsize + rows * 4),
+        flops=5.0 * n,
+        working_set_bytes=float(n * dt.itemsize + rows * 4),
+        rel_tol=accumulation_tolerance(cols, dt=dt),
+    )
+
+
 # Shapes per op. Memory-bound ops sweep across the L2 boundary on purpose;
 # compute-bound ops stay small enough that a float64 reference is affordable.
 OPS: dict[str, tuple[Callable[..., Problem], tuple[tuple[int, int], ...]]] = {
@@ -484,6 +638,12 @@ OPS: dict[str, tuple[Callable[..., Problem], tuple[tuple[int, int], ...]]] = {
     "layernorm": (_layernorm, ((512, 2048), (1024, 4096), (4096, 4096), (8192, 4096), (16384, 4096))),
     "swiglu": (_swiglu, ((512, 2048), (1024, 4096), (4096, 4096), (8192, 4096), (16384, 4096))),
     "quantize": (_quantize, ((512, 2048), (1024, 4096), (4096, 4096), (8192, 4096), (16384, 4096))),
+    # Head-dim widths, since that is what RoPE actually sees; rows sweep past 2x L2.
+    "rope": (_rope, ((4096, 128), (16384, 128), (65536, 128), (131072, 128), (262144, 128))),
+    # Rows of 512 bytes: wide enough that a gathered row is several sectors, narrow
+    # enough that the irregularity is not amortised away.
+    "gather": (_gather, ((8192, 128), (32768, 128), (131072, 128), (262144, 128))),
+    "cross_entropy": (_cross_entropy, ((4096, 4096), (8192, 4096), (16384, 4096), (32768, 4096))),
 }
 
 
