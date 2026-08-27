@@ -193,7 +193,7 @@ kernel. TrueForge shipped neither: `daytona` is the only exposed provider and we
 closed source in June 2026, and the bubblewrap-based local provider is a host-process
 sandbox that cannot fix a toolchain. So I wrote a container sandbox provider against
 TrueForge's existing `SandboxProvider` contract and its shared contract test suite:
-4/4 contract, 16/16 provider, default 273-test suite untouched, and
+4/4 contract, 16/16 provider, both default unit suites still green, and
 [submitted it upstream](https://github.com/truefoundry/trueforge/pull/467).
 
 Worth saying, since it is easy to assume otherwise: bubblewrap *can* reach a GPU. A

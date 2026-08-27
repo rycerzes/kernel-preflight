@@ -100,7 +100,7 @@ is a host-process sandbox, so it cannot fix a toolchain.
 
 So this contributes a **container sandbox provider** to TrueForge, written against
 its existing `SandboxProvider` contract and its shared contract test suite — 4/4
-contract, 16/16 provider, and the default 273-test unit suite untouched. It is
+contract, 16/16 provider, and both of their default unit suites still green. It is
 submitted upstream as
 [truefoundry/trueforge#467](https://github.com/truefoundry/trueforge/pull/467).
 
@@ -124,11 +124,13 @@ Measured on an RTX 4090 (sm_89, driver 580.159.04, CUDA 13.2):
 | --- | --- |
 | TrueForge's own `sandboxProviderContractSuite` | 4/4, incl. sibling-escape isolation |
 | Docker provider suites (contract + GPU + hardening) | 16/16 |
-| Default `packages/trueforge` unit suite, unaffected | 273/273, 35 suites |
+| `packages/trueforge` unit suite | 274/274, 36 suites (273 upstream plus one this adds) |
+| `trueforge-core` unit suite, unaffected | 388/389, 39 suites (1 skipped upstream) |
 | `nvidia-smi` inside the sandbox | RTX 4090 visible |
 | `nvcc -arch=sm_89` compile + run inside the sandbox | 921.2 / 1008.1 GB/s = 91.4% of peak |
 | 5 MiB upload/download round-trip | byte-exact |
-| Agent end to end: skill → sandbox → gates | admitted at 91.1% of DRAM peak, first submission |
+| Agent end to end: skill → sandbox → gates | rmsnorm admitted at 91.1% of the bus, first submission |
+| Agent on a compute-bound op it was not tuned for | Triton matmul admitted at 60.9% of the fp32 ceiling, beating the hand-written `triton_matmul.py` at 58.2% |
 | Gate unit suite | 35/35 |
 
 The device ceiling is corroborated two ways: `preflight.device` derives
@@ -179,7 +181,14 @@ attention ones, which pick a different winning shape from run to run. That gap i
 the argument for `variance` being a gate rather than a note, and it is the reason a
 single number from a single run is not evidence — including for the numbers above.
 
-### Five results worth reading
+### Six results worth reading
+
+**The agent declared the precision it actually computed in, unprompted.** Asked for
+"the fastest fp32 matmul you can in Triton", it pinned `input_precision="ieee"` rather
+than letting `tl.dot` quietly give it TF32 — and was admitted at 60.9% of the fp32
+ceiling, ahead of the hand-written baseline in this repo at 58.2%. Taking the default
+would have been faster and would have been rejected on correctness.
+
 
 **One true value passes a check built to need the whole output.** `timed_work`
 exists to prove the *measured* calls did the work, and it asks two things: that
@@ -405,6 +414,11 @@ The earlier review also found that candidate code was being compiled and execute
 **on the host**, in the process environment holding the publishing token — while
 this repository was contributing a GPU container sandbox to TrueForge. Execution now
 happens in a container with no network and no inherited environment.
+
+## Write-up
+
+[`BLOG.md`](BLOG.md) — what the harness caught, including the three times it caught
+me, and the five times a gate accused correct work.
 
 ## Notes
 
