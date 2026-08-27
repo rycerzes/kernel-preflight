@@ -139,45 +139,52 @@ bandwidth kernel measures against the same figure.
 
 ### The kernel matrix
 
-34 cases in one session on one GPU, with a thermal cooldown between each so the
+36 cases in one session on one GPU, with a thermal cooldown between each so the
 figures are comparable — `benchmark/full_matrix.py`. A sweep run straight after
 Helion's autotuner once read a third of the throughput of the same kernel idle,
 which is why Helion is scheduled last and why the harness samples the SM clock and
 says so when it ran below peak.
 
-**23 admitted, 11 not, and every one of the 8 adversarial candidates rejected.**
+**22 admitted, 14 not, and every one of the 10 adversarial candidates rejected.**
 
 One op, five toolchains — the comparison the gates are indifferent to, because they
 adjudicate a measurement schema rather than a toolchain:
 
 | rmsnorm | fp32, % of the 1008.1 GB/s bus |
 | --- | --- |
-| hand-written CUDA | 90.0% |
-| TileLang | 90.6% |
-| Triton | 89.5% |
-| Helion (autotuned) | 89.1% |
-| CuTe DSL, block per row via shared memory | 85.9% |
+| TileLang | 90.5% |
+| hand-written CUDA | 89.7% |
+| Triton | 88.9% |
+| Helion (autotuned) | 88.9%, measured separately — see below |
+| CuTe DSL, block per row via shared memory | 84.6% |
 | eager PyTorch | 26.1% |
 
-Memory-bound, other ops: CUDA softmax 89.8%, CUDA silu 91.3%, TileLang silu 90.6%,
-CuTe silu 88.7%, CUDA transpose 30.5%.
+Memory-bound, other ops: CUDA softmax 89.8%, CUDA silu 91.0%, TileLang silu 90.4%,
+CuTe silu 87.9%, CUDA transpose 30.8%.
 
 Reduced storage precision, on the backends that can honour it: Triton rmsnorm fp16
-90.0%, TileLang rmsnorm bf16 90.5%, TileLang silu fp16 90.8%, CuTe rmsnorm bf16 84.5%
-and fp16 84.7%, Triton FlashAttention fp16 81.5% of the fp16 ceiling.
+89.5%, TileLang rmsnorm bf16 90.4%, TileLang silu fp16 90.7%, CuTe rmsnorm bf16 82.4%
+and fp16 82.2%, Triton FlashAttention fp16 88.6% of the fp16 ceiling.
+
+Helion is the one figure not from this sweep, and the reason is worth stating rather
+than quietly substituting a better number. It is scheduled last because its autotuner
+runs for minutes, and in this run the contention that autotuning leaves behind failed
+its own `variance` gate. Re-measured on an idle device it passes at an interquartile
+spread of 1.06x and 88.9% of the bus. That is the gate working: the timing genuinely
+was not trustworthy at that moment, and it says so.
 
 Compute-bound, audited against the arithmetic ceiling rather than the bus:
 
 | kernel | declared | verdict |
 | --- | --- | --- |
-| Triton matmul, `input_precision="ieee"` | fp32 | 58.2% of fp32 pipelines |
+| Triton matmul, `input_precision="ieee"` | fp32 | 57.9% of fp32 pipelines |
 | Triton matmul, TF32 | fp32 | **rejected** — correctness, timed_work |
-| the same TF32 kernel | tf32 | 89.2% of tf32 pipelines |
+| the same TF32 kernel | tf32 | 90.9% of tf32 pipelines |
 | torch SDPA | fp32 | 29.2% |
-| torch SDPA | bf16 | 93.1% |
+| torch SDPA | bf16 | 92.7% |
 | Triton FlashAttention | fp32 | **rejected** — correctness, timed_work |
-| the same kernel | tf32 | 76.7% |
-| the same kernel | bf16 | 88.9% |
+| the same kernel | tf32 | 82.8% |
+| the same kernel | bf16 | 82.8% |
 
 Two independent sweeps of this matrix agree to within **0.3 points** on every
 memory-bound case and disagree by up to **6.8 points** on the compute-bound
@@ -185,7 +192,25 @@ attention ones, which pick a different winning shape from run to run. That gap i
 the argument for `variance` being a gate rather than a note, and it is the reason a
 single number from a single run is not evidence — including for the numbers above.
 
-### Six results worth reading
+### Seven results worth reading
+
+**One axis was covering for the other, and an attack got through.** A candidate that
+computes once and serves the answer from cache for the rest of the timed calls is
+refused on matmul at **18.4x the fp32 ceiling** — skipping a 4096-cubed GEMM for a
+64 MiB copy implies 1529 TFLOP/s. The same trick on rmsnorm was **admitted at 89.7% of
+the memory bus**, replacing an honest kernel that measures 26%. Nothing saw it:
+correctness held because a cached answer is right for the inputs it came from, the
+externally observed timing was satisfied because those calls really were that fast,
+and the roofline could not help because a copy moves exactly the traffic the harness
+charges while four FLOP an element sits far below the ridge point.
+
+The fix is that the answer now moves: one input is rotated by a single element before
+every timed sample, and the output is checked against the reference for the final input
+state. Nothing computed earlier stays valid and no candidate can tell which sample is
+last, so every sample has to do the work. It now fails `timed_work` by four orders of
+magnitude on both backends. Rotation rather than an offset for a reason — see the false
+accusations below.
+
 
 **The agent declared the precision it actually computed in, unprompted.** Asked for
 "the fastest fp32 matmul you can in Triton", it pinned `input_precision="ieee"` rather
@@ -245,11 +270,12 @@ compiled for, so the caches are keyed on shape.
 - **The worker's numbers are bounded, not proven.** See
   [the honest limits](#the-limit-this-does-not-clear).
 
-### Five false accusations
+### Six false accusations
 
-A gate that flags correct work is worse than no gate, and this project has
-built that gate five times. Each of these rejected an honest kernel before it was
-fixed:
+A gate that flags correct work is worse than no gate, and this project has built that
+gate six times. Each of these rejected an honest kernel before it was fixed, and the
+last one shipped *inside* another fix — which is the more useful lesson: the dangerous
+moment is not writing a new check, it is changing what the harness feeds the kernel.
 
 | what it flagged | why it was wrong |
 | --- | --- |
@@ -258,6 +284,7 @@ fixed:
 | an honest kernel's timing variance | at `repeats=10`, `(10*9)//10` indexes the last sample, so p90 *was* max |
 | torch's own matmul at 2.8e-2 | pure relative error explodes where cancellation puts the reference near zero |
 | a kernel at a third of its throughput | measured after 900 s of autotuning, against a ceiling that assumes peak clock |
+| a correct TF32 FlashAttention kernel | the fix above first offset the input by a constant, which shifted the softmax into a more saturated regime and raised the error 1.7x |
 
 ### The limit this does not clear
 
@@ -302,8 +329,8 @@ means the supervisor owning allocation and verification too — plausibly over C
 | `src/preflight/runner.py` | isolation: container, no network, no inherited environment |
 | `src/preflight/mcp_server.py` | the three tools TrueForge sees |
 | `src/preflight/device.py` | hardware ceilings read from the CUDA driver attribute API |
-| `src/preflight/harness/examples/` | 17 honest kernels across five toolchains, 8 adversarial, 1 merely wrong — all regression tests |
-| `benchmark/full_matrix.py` | the 34-case sweep behind the table above |
+| `src/preflight/harness/examples/` | 17 honest kernels across five toolchains, 10 adversarial, 1 merely wrong — all regression tests |
+| `benchmark/full_matrix.py` | the 36-case sweep behind the table above |
 | `tests/` | 39 gate tests, including the ones that fail against the pre-fix code |
 | `agent/` | the saved TrueForge agent manifest |
 | `docker/` | the sandbox images: CUDA, plus torch/Triton/Helion/CuTe/TileLang |
