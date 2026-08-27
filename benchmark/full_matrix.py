@@ -59,6 +59,14 @@ CASES = [
     ("triton_gather.py",              "gather",        "triton", "fp32", "one program per gathered row"),
     ("torch_cross_entropy.py",        "cross_entropy", "torch",  "fp32", "torch's fused loss"),
     ("triton_cross_entropy.py",       "cross_entropy", "triton", "fp32", "two passes, row-wide shift"),
+    # --- Attention as it is actually deployed: causal for training and prefill,
+    # --- single-query decode for generation. Decode is the only attention shape here
+    # --- that lands on the memory side of the ridge point.
+    ("torch_attention_causal.py",         "attention_causal", "torch",  "fp32", "SDPA is_causal"),
+    ("triton_flash_attention_causal.py",  "attention_causal", "triton", "tf32", "skips tiles above the diagonal"),
+    ("triton_flash_attention_causal.py",  "attention_causal", "triton", "bf16", "same kernel, bf16"),
+    ("torch_attention_decode.py",         "attention_decode", "torch",  "fp32", "SDPA on a single query"),
+    ("triton_attention_decode.py",        "attention_decode", "triton", "fp32", "one program per head"),
     # --- Wrong, but not dishonest. Must fail on correctness with a readable reason.
     ("wrong_transpose.cu",            "transpose", "cuda",     "fp32", "off by one row"),
     # --- Adversarial. Every one of these must be rejected.

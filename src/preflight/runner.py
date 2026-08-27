@@ -60,6 +60,9 @@ PYTHON_OPS = (
     # deployed transformer runs it and fusing it with attention is where the
     # inference engines find their wins.
     "rope", "gather", "cross_entropy",
+    # Causal changes the FLOP count; decode moves attention to the other side of the
+    # ridge point, so the same schema gets audited against a different ceiling.
+    "attention_causal", "attention_decode",
 )
 PYTHON_BACKENDS = ("triton", "helion", "torch", "cute", "tilelang")
 SUPPORTED_BACKENDS = ("cuda", *PYTHON_BACKENDS)

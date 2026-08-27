@@ -166,9 +166,24 @@ def _shape_label(shape: dict[str, Any]) -> str:
     return f"{shape['rows']}x{shape['cols']}"
 
 
-# TF32 rounds operands to 10 mantissa bits and accumulates in fp32, so its error
-# is operand quantisation: a flat bar, with the usual safety factor.
-TF32_TOLERANCE = 8.0 * 2.0 ** -(MANTISSA_BITS["tf32"] + 1)
+# TF32 rounds operands to 10 mantissa bits and accumulates in fp32, so its error is
+# operand quantisation and does not grow with reduction depth. What it does depend on is
+# how much averaging the operation gives that quantisation, and that is not the gate's
+# business to know -- so the harness reports a per-shape `quantisation_safety` and this
+# only supplies the unit roundoff.
+#
+# The distinction is not theoretical. With one flat factor of 8 the bar sat exactly on
+# top of legitimate variation: non-causal FlashAttention passed at 0.78 of it while the
+# *causal* version of the same kernel failed at up to 2.2x, with a worst absolute error
+# of 1.2e-3 against 1.3e-4. That gap is the operation, not the kernel -- a causal row
+# near the start of the sequence attends to one or two keys, so its output is a
+# TF32-rounded weight times a TF32-rounded value with no averaging at all. Raising the
+# single constant far enough for that would have made it six times looser than a TF32
+# matmul needs, which is why it is per op instead.
+TF32_UNIT_ROUNDOFF = 2.0 ** -(MANTISSA_BITS["tf32"] + 1)
+
+# Used when a measurement predates the field, so an old one still grades.
+DEFAULT_QUANTISATION_SAFETY = 8.0
 
 
 def _times(x: float) -> str:
@@ -199,8 +214,9 @@ def _violation_scale(measurement: dict[str, Any], shape: dict[str, Any]) -> floa
     A fixed multiplier therefore gets the shape of the curve wrong as well as its
     height. Multiplying a sqrt(depth) base by 2^13 reached 0.5 at k=4096 -- about
     128x looser than the contract, and loosening further the deeper the reduction,
-    which is backwards. The bar is `TF32_TOLERANCE` instead, converted here into
-    the units `violation` is already reported in.
+    which is backwards. The bar is instead a flat one: the harness's per-op
+    `quantisation_safety` times the TF32 unit roundoff, converted here into the units
+    `violation` is already reported in.
 
     Never below 1.0: for a reduction deep enough that the fp32 accumulation bar
     exceeds the TF32 quantisation bar, the wider of the two is the honest one, and
@@ -212,7 +228,8 @@ def _violation_scale(measurement: dict[str, Any], shape: dict[str, Any]) -> floa
     reported = float(shape.get("rel_tol", 0.0))
     if reported <= 0.0:
         return 1.0
-    return max(1.0, TF32_TOLERANCE / reported)
+    safety = float(shape.get("quantisation_safety") or DEFAULT_QUANTISATION_SAFETY)
+    return max(1.0, safety * TF32_UNIT_ROUNDOFF / reported)
 
 
 def check_correctness(measurement: dict[str, Any]) -> GateResult:

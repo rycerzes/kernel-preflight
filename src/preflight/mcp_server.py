@@ -75,7 +75,10 @@ def device_spec() -> dict[str, Any]:
         "i + d/2 so the row cannot be tiled independently), gather (inputs table, "
         "idx; out[i] = table[idx[i]], irregular access that cannot reach peak "
         "bandwidth at any quality), and cross_entropy (inputs logits, target; one "
-        "unreduced loss per row, so the output is smaller than the input)."
+        "unreduced loss per row, so the output is smaller than the input), "
+        "attention_causal (masked, so the FLOP count is halved and the cost model says "
+        "so) and attention_decode (one query against a KV cache, which is memory-bound "
+        "rather than compute-bound and is audited against the bus)."
     ),
 )
 def preflight_kernel(
@@ -84,8 +87,9 @@ def preflight_kernel(
         str,
         Field(
             description="Operation to measure: rmsnorm, softmax, silu or transpose on any "
-            "backend; matmul, attention, layernorm, swiglu, quantize, rope, gather and "
-            "cross_entropy on the Python backends only."
+            "backend; matmul, attention, layernorm, swiglu, quantize, rope, gather, "
+            "cross_entropy, attention_causal and attention_decode on the Python "
+            "backends only."
         ),
     ] = "rmsnorm",
     arch: Annotated[str, Field(description="Target architecture, e.g. sm_89.")] = "sm_89",

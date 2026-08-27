@@ -165,6 +165,13 @@ class Problem:
     flops: float
     working_set_bytes: float
     rel_tol: float
+    # Multiple of the declared precision's unit roundoff this op is allowed, for compute
+    # modes the storage dtype cannot reveal -- currently tf32 only. Per op, because
+    # operand quantisation is not equally forgiving everywhere: a deep dot product
+    # averages the rounding down, while a causal attention row attending to one key does
+    # not average at all. Measured on this hardware: TF32 matmul deviates by 1.5e-3 and
+    # causal FlashAttention by 8.7e-3, a factor of six for the same compute mode.
+    quantisation_safety: float = 8.0
 
 
 def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
@@ -469,6 +476,7 @@ def _attention(seq: int, head_dim: int, seed: int, dev: torch.device, dt: torch.
         # the measured deviation sits at roughly a quarter of this bound instead of
         # a sixteenth. A gate with 16x of headroom is barely a gate.
         rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=24.0,
     )
 
 
@@ -626,6 +634,107 @@ def _cross_entropy(rows: int, cols: int, seed: int, dev: torch.device, dt: torch
     )
 
 
+def _attention_causal(seq: int, head_dim: int, seed: int, dev: torch.device,
+                      dt: torch.dtype) -> Problem:
+    """Causal attention: the mask every autoregressive model runs under.
+
+    A separate op rather than a flag, because the mask changes the cost model. Only the
+    lower triangle is computed, so the work is seq*(seq+1)/2 score entries instead of
+    seq^2 -- almost exactly half, and `flops` says so. Charging the full seq^2 would
+    make a correct kernel look twice as fast as it is, the same class of error as the
+    gather cost model.
+
+    Kernel-side, half the tiles can be skipped outright and only the tiles straddling
+    the diagonal need an element-wise mask. A kernel that masks every tile instead is
+    equally correct and close to twice the work, which is exactly the difference a
+    speed claim ought to be able to distinguish.
+
+    Also the harness's worst case for TF32: a row near the start attends to one or two
+    keys, so operand quantisation gets no averaging at all -- see quantisation_safety.
+    """
+    batch, heads = 4, 8
+    shape = (batch, heads, seq, head_dim)
+    q = make_input(shape, seed, dev, exponent_range=0, dtype=dt)
+    k = make_input(shape, seed ^ 0xA11, dev, exponent_range=0, dtype=dt)
+    v = make_input(shape, seed ^ 0xB22, dev, exponent_range=0, dtype=dt)
+
+    def _ref() -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.double(), k.double(), v.double(), is_causal=True
+        )
+
+    ref = _ref()
+    elements = batch * heads * seq * head_dim
+    pairs = seq * (seq + 1) // 2
+    return Problem(
+        label=f"b{batch}h{heads}s{seq}d{head_dim}",
+        inputs={"q": q, "k": k, "v": v},
+        out=torch.empty(shape, device=dev, dtype=dt),
+        meta={"batch": batch, "heads": heads, "seq": seq, "head_dim": head_dim,
+              "causal": True},
+        reference=ref,
+        recompute=_ref,
+        bytes_moved=float(4 * elements * dt.itemsize),
+        flops=4.0 * batch * heads * pairs * head_dim,
+        working_set_bytes=float(4 * elements * dt.itemsize),
+        rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=24.0,
+    )
+
+
+def _attention_decode(seq: int, head_dim: int, seed: int, dev: torch.device,
+                      dt: torch.dtype) -> Problem:
+    """Decode attention: one query against a KV cache. The other side of the ridge point.
+
+    Every other attention op here is prefill -- seq queries against seq keys, which is
+    compute-bound and audited against the arithmetic ceiling. Generation is not. A single
+    query token attends to the whole cache, so the work is O(seq * d) while the traffic
+    is also O(seq * d): arithmetic intensity is about 0.5 FLOP/byte against a ridge point
+    near 82, which puts it decisively on the memory side.
+
+    That makes it the most useful attention shape here for the harness itself. Same
+    operation family, same reference, and the roofline gate selects a different ceiling
+    for it without being told -- which is the property that lets one schema cover
+    fourteen operations.
+
+    It is also where the real kernels live: this is what paged attention and
+    FlashDecoding exist to optimise, and the reason is visible in the shape. There are
+    only batch*heads = 32 units of parallelism against 128 SMs, so a kernel assigning one
+    program per head leaves most of the GPU idle however well it streams. Splitting the
+    cache across programs and combining the partial softmax states afterwards is
+    precisely FlashDecoding.
+    """
+    batch, heads = 4, 8
+    kv_shape = (batch, heads, seq, head_dim)
+    q_shape = (batch, heads, 1, head_dim)
+    q = make_input(q_shape, seed, dev, exponent_range=0, dtype=dt)
+    k = make_input(kv_shape, seed ^ 0xA11, dev, exponent_range=0, dtype=dt)
+    v = make_input(kv_shape, seed ^ 0xB22, dev, exponent_range=0, dtype=dt)
+
+    def _ref() -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.double(), k.double(), v.double()
+        )
+
+    ref = _ref()
+    cache_elements = batch * heads * seq * head_dim
+    query_elements = batch * heads * head_dim
+    return Problem(
+        label=f"b{batch}h{heads}s{seq}d{head_dim}",
+        inputs={"q": q, "k": k, "v": v},
+        out=torch.empty(q_shape, device=dev, dtype=dt),
+        meta={"batch": batch, "heads": heads, "seq": seq, "head_dim": head_dim,
+              "decode": True},
+        reference=ref,
+        recompute=_ref,
+        bytes_moved=float((2 * cache_elements + 2 * query_elements) * dt.itemsize),
+        flops=4.0 * batch * heads * seq * head_dim,
+        working_set_bytes=float((2 * cache_elements + 2 * query_elements) * dt.itemsize),
+        rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=24.0,
+    )
+
+
 # Shapes per op. Memory-bound ops sweep across the L2 boundary on purpose;
 # compute-bound ops stay small enough that a float64 reference is affordable.
 OPS: dict[str, tuple[Callable[..., Problem], tuple[tuple[int, int], ...]]] = {
@@ -644,6 +753,9 @@ OPS: dict[str, tuple[Callable[..., Problem], tuple[tuple[int, int], ...]]] = {
     # enough that the irregularity is not amortised away.
     "gather": (_gather, ((8192, 128), (32768, 128), (131072, 128), (262144, 128))),
     "cross_entropy": (_cross_entropy, ((4096, 4096), (8192, 4096), (16384, 4096), (32768, 4096))),
+    "attention_causal": (_attention_causal, ((512, 64), (1024, 64), (2048, 64), (1024, 128))),
+    # Cache lengths, not prefill lengths: long enough that K and V clear 2x L2.
+    "attention_decode": (_attention_decode, ((2048, 128), (8192, 128), (16384, 128), (32768, 128))),
 }
 
 
@@ -898,6 +1010,7 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int,
         "timed_max_rel_err": timed_rel,
         "timed_violation": timed_violation,
         "rel_tol": problem.rel_tol,
+        "quantisation_safety": problem.quantisation_safety,
         "bytes_moved": problem.bytes_moved,
         "flops": problem.flops,
         "working_set_bytes": problem.working_set_bytes,
