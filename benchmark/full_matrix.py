@@ -39,6 +39,45 @@ CASES = [
     ("triton_flash_attention.py",     "attention", "triton",   "fp32", "FlashAttention declared fp32"),
     ("triton_flash_attention.py",     "attention", "triton",   "tf32", "the same kernel, declared tf32"),
     ("triton_flash_attention.py",     "attention", "triton",   "bf16", "the same kernel, declared bf16"),
+    # --- The two categories KernelBenchX finds hardest, plus LayerNorm's two-stage
+    # --- reduction. Fusion fails 72% of the time across every method they tested and
+    # --- Quantization is 0 of 30, so these are where a harness earns its keep.
+    ("torch_layernorm.py",            "layernorm", "torch",    "fp32", "torch's fused layer_norm"),
+    ("triton_layernorm.py",           "layernorm", "triton",   "fp32", "one pass, mean and variance together"),
+    ("torch_swiglu.py",               "swiglu",    "torch",    "fp32", "unfused, materialises the intermediate"),
+    ("triton_swiglu.py",              "swiglu",    "triton",   "fp32", "fused, one pass per input"),
+    ("tilelang_swiglu.py",            "swiglu",    "tilelang", "fp32", "fused, TileLang"),
+    ("cute_swiglu.py",                "swiglu",    "cute",     "fp32", "fused, CuTe DSL"),
+    ("torch_quantize.py",             "quantize",  "torch",    "fp32", "unfused int8 round trip"),
+    ("triton_quantize.py",            "quantize",  "triton",   "fp32", "exponent from the float bits"),
+    # --- Index and Loss from the same taxonomy, plus RoPE because every deployed
+    # --- transformer runs it and fusing it with attention is where the inference
+    # --- engines find their wins.
+    ("torch_rope.py",                 "rope",          "torch",  "fp32", "slices and a concatenate"),
+    ("triton_rope.py",                "rope",          "triton", "fp32", "both halves in one program"),
+    ("torch_gather.py",               "gather",        "torch",  "fp32", "index_select"),
+    ("triton_gather.py",              "gather",        "triton", "fp32", "one program per gathered row"),
+    ("torch_cross_entropy.py",        "cross_entropy", "torch",  "fp32", "torch's fused loss"),
+    ("triton_cross_entropy.py",       "cross_entropy", "triton", "fp32", "two passes, row-wide shift"),
+    # --- Attention as it is actually deployed: causal for training and prefill,
+    # --- single-query decode for generation. Decode is the only attention shape here
+    # --- that lands on the memory side of the ridge point.
+    ("torch_attention_causal.py",         "attention_causal", "torch",  "fp32", "SDPA is_causal"),
+    ("triton_flash_attention_causal.py",  "attention_causal", "triton", "tf32", "skips tiles above the diagonal"),
+    ("triton_flash_attention_causal.py",  "attention_causal", "triton", "bf16", "same kernel, bf16"),
+    ("torch_attention_decode.py",         "attention_decode", "torch",  "fp32", "SDPA on a single query"),
+    ("triton_attention_decode.py",        "attention_decode", "triton", "fp32", "one program per head"),
+    # --- Attention and MoE as a serving stack actually runs them.
+    ("torch_attention_gqa.py",            "attention_gqa",      "torch",  "fp32", "expands the KV heads"),
+    ("triton_attention_gqa.py",           "attention_gqa",      "triton", "tf32", "indexes the shared KV head"),
+    ("triton_attention_gqa.py",           "attention_gqa",      "triton", "bf16", "same kernel, bf16"),
+    ("torch_attention_paged.py",          "attention_paged",    "torch",  "fp32", "gathers the blocks first"),
+    ("triton_attention_paged.py",         "attention_paged",    "triton", "fp32", "walks the block table"),
+    ("torch_attention_backward.py",       "attention_backward", "torch",  "fp32", "autograd over fused SDPA"),
+    ("triton_attention_backward.py",      "attention_backward", "triton", "fp32", "three kernels, no seq^2 stored"),
+    ("triton_attention_backward.py",      "attention_backward", "triton", "bf16", "same kernel, bf16"),
+    ("torch_moe_gemm.py",                 "moe_gemm",           "torch",  "fp32", "one GEMM per expert"),
+    ("triton_moe_gemm.py",                "moe_gemm",           "triton", "fp32", "permute, grouped GEMM, scatter"),
     # --- Wrong, but not dishonest. Must fail on correctness with a readable reason.
     ("wrong_transpose.cu",            "transpose", "cuda",     "fp32", "off by one row"),
     # --- Adversarial. Every one of these must be rejected.
@@ -50,6 +89,17 @@ CASES = [
     ("cheat_python_forge.py",         "rmsnorm",   "torch",    "fp32", "forges a verdict from sys.argv at import"),
     ("cheat_timed_nan.py",            "rmsnorm",   "torch",    "fp32", "one true value and NaNs, only while timed"),
     ("cheat_silent_bf16.py",          "attention", "torch",    "fp32", "computes in bf16 while declaring fp32"),
+    ("cheat_pay_the_clock.py",        "matmul",    "torch",    "fp32", "cached answer, caught on the compute axis"),
+    ("cheat_cached_timed.py",         "rmsnorm",   "torch",    "fp32", "cached answer, memory-bound: needs the input drift"),
+    ("cheat_truncating_quantize.py",  "quantize",  "torch",    "fp32", "truncates instead of rounding"),
+    ("cheat_blockwise_cross_entropy.py", "cross_entropy", "torch", "fp32", "per-tile max, partials not rescaled"),
+    # --- Reduced storage precision, on the backends that can honour it.
+    ("triton_rmsnorm.py",             "rmsnorm",   "triton",   "fp16", "fp16 storage"),
+    ("tilelang_rmsnorm.py",           "rmsnorm",   "tilelang", "bf16", "bf16 storage"),
+    ("tilelang_silu.py",              "silu",      "tilelang", "fp16", "fp16 storage"),
+    ("cute_rmsnorm.py",               "rmsnorm",   "cute",     "bf16", "bf16 storage"),
+    ("cute_rmsnorm.py",               "rmsnorm",   "cute",     "fp16", "fp16 storage"),
+    ("triton_flash_attention.py",     "attention", "triton",   "fp16", "fp16 tensor cores"),
     # Last on purpose: autotuning runs for minutes and leaves the GPU hot.
     ("helion_rmsnorm.py",             "rmsnorm",   "helion",   "fp32", "Helion (autotuned)"),
 ]

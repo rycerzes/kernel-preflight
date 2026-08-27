@@ -242,3 +242,46 @@ def test_all_resident_without_arithmetic_is_not_applicable() -> None:
     m = measurement(flops=0.0, median_ms=0.6, peak_flops=0.0)
     m["shapes"][0]["working_set_bytes"] = 8 * 1024 * 1024
     assert check_roofline(m).status is GateStatus.NOT_APPLICABLE
+
+
+# ---------------------------------------------------------------------------
+# Variance: a failure has to say whether to re-run or to rewrite
+# ---------------------------------------------------------------------------
+
+from preflight.gates import check_variance  # noqa: E402
+
+
+def _unstable(*, observed_clock: float | None, peak_clock: float = 2.52e9) -> dict:
+    m = measurement(flops=WORKING_SET, median_ms=1.0)
+    m["sm_clock_hz"] = peak_clock
+    shape = m["shapes"][0]
+    # A whole quartile 2x slower than another quartile.
+    shape["p25_ms"], shape["p75_ms"] = 1.0, 2.0
+    shape["sm_clock_hz_observed"] = observed_clock
+    return m
+
+
+def test_variance_failure_blames_the_device_when_the_clock_was_low() -> None:
+    result = check_variance(_unstable(observed_clock=1.0e9))
+    assert result.status is GateStatus.FAIL
+    assert "re-run on an idle device" in result.detail
+    assert "40% of peak clock" in result.detail
+
+
+def test_variance_failure_blames_the_kernel_when_the_clock_held() -> None:
+    result = check_variance(_unstable(observed_clock=2.5e9))
+    assert result.status is GateStatus.FAIL
+    assert "the kernel rather than the machine" in result.detail
+
+
+def test_variance_failure_says_nothing_extra_without_clock_samples() -> None:
+    """A CUDA-harness measurement carries no per-shape clock; do not invent one."""
+    result = check_variance(_unstable(observed_clock=None))
+    assert result.status is GateStatus.FAIL
+    assert "clock" not in result.detail
+
+
+def test_stable_timing_still_passes() -> None:
+    m = _unstable(observed_clock=2.5e9)
+    m["shapes"][0]["p25_ms"], m["shapes"][0]["p75_ms"] = 1.0, 1.05
+    assert check_variance(m).status is GateStatus.PASS

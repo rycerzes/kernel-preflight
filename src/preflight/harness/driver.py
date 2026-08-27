@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import ctypes
 import json
 import math
 import os
@@ -156,18 +157,45 @@ class Problem:
     out: torch.Tensor
     meta: dict[str, Any]
     reference: torch.Tensor  # float64, computed by the harness
+    # Recomputes `reference` from whatever the input tensors currently hold. The
+    # timing loop perturbs an input before every sample, so the answer changes
+    # constantly and a candidate cannot serve one it computed earlier.
+    recompute: Callable[[], torch.Tensor]
     bytes_moved: float
     flops: float
     working_set_bytes: float
     rel_tol: float
+    # Multiple of the declared precision's unit roundoff this op is allowed, for compute
+    # modes the storage dtype cannot reveal -- currently tf32 only. Per op, because
+    # operand quantisation is not equally forgiving everywhere: a deep dot product
+    # averages the rounding down, while a causal attention row attending to one key does
+    # not average at all. Measured on this hardware: TF32 matmul deviates by 1.5e-3 and
+    # causal FlashAttention by 8.7e-3, a factor of six for the same compute mode.
+    #
+    # Calibrated against a reference implementation rather than against the kernels in
+    # this repository, which is the only way to tell a loose bar from a sloppy kernel.
+    # torch's own TF32 causal attention scores 185.8 on the harness's violation scale at
+    # seq=2048 where the Triton kernel here scores 201.5 -- 8% apart, so neither is the
+    # outlier. The attention family therefore uses 48, which puts torch's implementation
+    # at about a third of the bar: enough room for the spread across input data, and
+    # still refusing anything roughly three times worse than a reference kernel.
+    #
+    # It was 24 first, and that failed the causal kernel in a full sweep while passing it
+    # in isolation -- the sweep runs more repeats, so the input has rotated further and
+    # the post-timing error is drawn from a different sample. A bar a correct kernel
+    # crosses depending on the repeat count is not a bar.
+    quantisation_safety: float = 8.0
 
 
 def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     x = make_input((rows, cols), seed, dev, dtype=dt)
     w = make_input((cols,), seed ^ 0x5EED, dev, dtype=dt)
     eps = 1e-6
-    xd, wd = x.double(), w.double()
-    ref = xd * torch.rsqrt(xd.pow(2).mean(dim=-1, keepdim=True) + eps) * wd
+    def _ref() -> torch.Tensor:
+        xd, wd = x.double(), w.double()
+        return xd * torch.rsqrt(xd.pow(2).mean(dim=-1, keepdim=True) + eps) * wd
+
+    ref = _ref()
     n = rows * cols
     return Problem(
         label=f"{rows}x{cols}",
@@ -175,6 +203,7 @@ def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype
         out=torch.empty_like(x),
         meta={"rows": rows, "cols": cols, "eps": eps},
         reference=ref,
+        recompute=_ref,
         bytes_moved=2.0 * n * dt.itemsize,
         flops=4.0 * n,
         working_set_bytes=2.0 * n * dt.itemsize,
@@ -184,7 +213,11 @@ def _rmsnorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype
 
 def _softmax(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     x = make_input((rows, cols), seed, dev, dtype=dt)
-    ref = torch.softmax(x.double(), dim=-1)
+
+    def _ref() -> torch.Tensor:
+        return torch.softmax(x.double(), dim=-1)
+
+    ref = _ref()
     n = rows * cols
     return Problem(
         label=f"{rows}x{cols}",
@@ -192,6 +225,7 @@ def _softmax(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype
         out=torch.empty_like(x),
         meta={"rows": rows, "cols": cols},
         reference=ref,
+        recompute=_ref,
         bytes_moved=2.0 * n * dt.itemsize,
         flops=5.0 * n,
         working_set_bytes=2.0 * n * dt.itemsize,
@@ -201,8 +235,12 @@ def _softmax(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype
 
 def _silu(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     x = make_input((rows, cols), seed, dev, dtype=dt)
-    xd = x.double()
-    ref = xd * torch.sigmoid(xd)
+
+    def _ref() -> torch.Tensor:
+        xd = x.double()
+        return xd * torch.sigmoid(xd)
+
+    ref = _ref()
     n = rows * cols
     return Problem(
         label=f"{rows}x{cols}",
@@ -210,6 +248,7 @@ def _silu(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -
         out=torch.empty_like(x),
         meta={"rows": rows, "cols": cols},
         reference=ref,
+        recompute=_ref,
         bytes_moved=2.0 * n * dt.itemsize,
         flops=4.0 * n,
         working_set_bytes=2.0 * n * dt.itemsize,
@@ -219,7 +258,11 @@ def _silu(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -
 
 def _transpose(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     x = make_input((rows, cols), seed, dev, dtype=dt)
-    ref = x.double().t().contiguous()
+
+    def _ref() -> torch.Tensor:
+        return x.double().t().contiguous()
+
+    ref = _ref()
     n = rows * cols
     return Problem(
         label=f"{rows}x{cols}",
@@ -227,11 +270,153 @@ def _transpose(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dty
         out=torch.empty((cols, rows), device=dev, dtype=dt),
         meta={"rows": rows, "cols": cols},
         reference=ref,
+        recompute=_ref,
         bytes_moved=2.0 * n * dt.itemsize,
         flops=0.0,
         # Pure data movement: bit-exact, so no accumulation allowance.
         rel_tol=0.0,
         working_set_bytes=2.0 * n * dt.itemsize,
+    )
+
+
+def _layernorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """LayerNorm with affine gamma and beta.
+
+    Distinct from rmsnorm rather than a variation on it: rmsnorm needs one reduction,
+    LayerNorm needs the mean before the variance. A kernel can compute both in one
+    pass with Welford or a sum/sum-of-squares pair, and getting the numerics of that
+    wrong is the classic error in this operation -- E[x^2] - E[x]^2 loses catastrophic
+    precision when the mean dominates the variance, which is exactly the case these
+    inputs produce.
+
+    KernelBenchX puts Normalization in the middle of its difficulty range and finds
+    the failures come from scope: normalising over the wrong axis, or mixing
+    statistics across rows.
+    """
+    x = make_input((rows, cols), seed, dev, dtype=dt)
+    gamma = make_input((cols,), seed ^ 0x6A11, dev, dtype=dt)
+    beta = make_input((cols,), seed ^ 0x7B22, dev, dtype=dt)
+    eps = 1e-5
+
+    def _ref() -> torch.Tensor:
+        xd, gd, bd = x.double(), gamma.double(), beta.double()
+        mean = xd.mean(dim=-1, keepdim=True)
+        var = (xd - mean).pow(2).mean(dim=-1, keepdim=True)
+        return (xd - mean) * torch.rsqrt(var + eps) * gd + bd
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"x": x, "gamma": gamma, "beta": beta},
+        out=torch.empty_like(x),
+        meta={"rows": rows, "cols": cols, "eps": eps},
+        reference=ref,
+        recompute=_ref,
+        bytes_moved=2.0 * n * dt.itemsize,
+        flops=8.0 * n,
+        working_set_bytes=2.0 * n * dt.itemsize,
+        rel_tol=accumulation_tolerance(cols, dt=dt),
+    )
+
+
+def _swiglu(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """SwiGLU gating: silu(a) * b, the second half of a Llama-style MLP.
+
+    Here because Fusion is both the largest category in KernelBenchX (60 of 176 tasks)
+    and by far the worst performing: 72% of its tasks fail across every method they
+    tested. The interest is not the arithmetic, which is trivial, but that a fused
+    kernel has to hold an invariant across an operator boundary that the unfused
+    version gets from materialising an intermediate.
+
+    Three passes of traffic against five FLOP an element, so it is firmly
+    memory-bound and the question is whether a candidate reads each input once.
+    """
+    a = make_input((rows, cols), seed, dev, dtype=dt)
+    b = make_input((rows, cols), seed ^ 0x9C33, dev, dtype=dt)
+
+    def _ref() -> torch.Tensor:
+        ad, bd = a.double(), b.double()
+        return ad * torch.sigmoid(ad) * bd
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"a": a, "b": b},
+        out=torch.empty_like(a),
+        meta={"rows": rows, "cols": cols},
+        reference=ref,
+        recompute=_ref,
+        # a and b read, out written.
+        bytes_moved=3.0 * n * dt.itemsize,
+        flops=5.0 * n,
+        working_set_bytes=3.0 * n * dt.itemsize,
+        rel_tol=accumulation_tolerance(1, dt=dt),
+    )
+
+
+def _quantize(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """Per-row symmetric int8 quantise-dequantise with a power-of-two scale.
+
+    Quantization is the category KernelBenchX reports as completely unsolved -- 0
+    successes out of 30 across every method they evaluated -- because it is the one
+    that cannot be done by transcribing a formula. The kernel has to derive its own
+    scale from a reduction, round rather than truncate, clamp to the integer range, and
+    scale back.
+
+    **The scale is a power of two, and that is not a simplification.** The first
+    version of this op used absmax/127, and it could not be graded: quantization is a
+    discontinuous function, so a value within an ulp of a rounding boundary lands on a
+    different integer in float32 than in the float64 reference, and the disagreement is
+    a full step -- measured at 7.7% relative error on a correct kernel. Comparing a
+    discontinuous operation against a higher-precision reference is ill-posed wherever
+    the input sits near a discontinuity, and no tolerance fixes that: one wide enough to
+    admit the boundary cases also admits truncation, which is the error the op exists to
+    catch.
+
+    A power-of-two scale removes the ambiguity instead of tolerating it. `absmax` is
+    exact because a max reduction is exact; taking its binary exponent with `frexp` is
+    exact; dividing by 2^k is an exponent shift and therefore exact; so `x / scale` is
+    identical in float32 and float64 and `round` lands on the same integer in both. The
+    whole round trip is bit-exact, the tolerance can stay at storage quantisation, and a
+    kernel that truncates instead of rounding fails immediately rather than hiding
+    inside an allowance.
+
+    Scaling by a power of two is also what several real quantisation schemes do, for
+    the same reason.
+    """
+    x = make_input((rows, cols), seed, dev, dtype=dt)
+    qmax = 127.0
+
+    def _ref() -> torch.Tensor:
+        xd = x.double()
+        absmax = xd.abs().amax(dim=-1, keepdim=True)
+        # 2^e with absmax in [2^(e-1), 2^e), then /128 rather than /127 so the divisor
+        # is itself a power of two and the division stays exact.
+        _, exponent = torch.frexp(absmax)
+        scale = torch.ldexp(torch.ones_like(absmax), exponent - 7)
+        # An all-zero row has no scale; leave it rather than divide by zero.
+        scale = torch.where(absmax > 0, scale, torch.ones_like(scale))
+        q = torch.clamp(torch.round(xd / scale), -qmax, qmax)
+        return q * scale
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"x": x},
+        out=torch.empty_like(x),
+        meta={"rows": rows, "cols": cols, "qmax": qmax},
+        reference=ref,
+        recompute=_ref,
+        bytes_moved=2.0 * n * dt.itemsize,
+        flops=4.0 * n,
+        working_set_bytes=2.0 * n * dt.itemsize,
+        # Deliberately not an accumulation tolerance: nothing accumulates, and with a
+        # power-of-two scale nothing rounds either. The bar is storage quantisation
+        # alone, which is as tight as this harness can ask for.
+        rel_tol=8.0 * quantisation_error(dt),
     )
 
 
@@ -248,13 +433,17 @@ def _matmul(m: int, k: int, seed: int, dev: torch.device, dt: torch.dtype) -> Pr
     # more precision to cancellation than any tolerance should forgive.
     a = make_input((m, k), seed, dev, exponent_range=0, dtype=dt)
     b = make_input((k, n), seed ^ 0xB00, dev, exponent_range=0, dtype=dt)
-    ref = a.double() @ b.double()
+    def _ref() -> torch.Tensor:
+        return a.double() @ b.double()
+
+    ref = _ref()
     return Problem(
         label=f"{m}x{k}x{n}",
         inputs={"a": a, "b": b},
         out=torch.empty((m, n), device=dev, dtype=dt),
         meta={"m": m, "k": k, "n": n},
         reference=ref,
+        recompute=_ref,
         bytes_moved=float((m * k + k * n + m * n) * dt.itemsize),
         flops=2.0 * m * k * n,
         working_set_bytes=float((m * k + k * n + m * n) * dt.itemsize),
@@ -277,7 +466,10 @@ def _attention(seq: int, head_dim: int, seed: int, dev: torch.device, dt: torch.
     q = make_input(shape, seed, dev, exponent_range=0, dtype=dt)
     k = make_input(shape, seed ^ 0xA11, dev, exponent_range=0, dtype=dt)
     v = make_input(shape, seed ^ 0xB22, dev, exponent_range=0, dtype=dt)
-    ref = torch.nn.functional.scaled_dot_product_attention(q.double(), k.double(), v.double())
+    def _ref() -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(q.double(), k.double(), v.double())
+
+    ref = _ref()
     elements = batch * heads * seq * head_dim
     # QK^T and PV are each 2*b*h*s*s*d; the softmax is negligible beside them.
     flops = 4.0 * batch * heads * seq * seq * head_dim
@@ -287,6 +479,7 @@ def _attention(seq: int, head_dim: int, seed: int, dev: torch.device, dt: torch.
         out=torch.empty(shape, device=dev, dtype=dt),
         meta={"batch": batch, "heads": heads, "seq": seq, "head_dim": head_dim},
         reference=ref,
+        recompute=_ref,
         bytes_moved=float(4 * elements * dt.itemsize),  # q, k, v read; o written
         flops=flops,
         working_set_bytes=float(4 * elements * dt.itemsize),
@@ -296,6 +489,529 @@ def _attention(seq: int, head_dim: int, seed: int, dev: torch.device, dt: torch.
         # the measured deviation sits at roughly a quarter of this bound instead of
         # a sixteenth. A gate with 16x of headroom is barely a gate.
         rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=48.0,
+    )
+
+
+def _rope(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """Rotary position embedding, the split-half convention Llama and GPT-NeoX use.
+
+    Chosen because it is one of the few kernels essentially every deployed transformer
+    runs, and because fusing it with attention is where real inference engines find
+    their wins -- FlashInfer reports 28-30% latency reduction from exactly that fusion.
+
+    Elementwise in traffic but not in structure: output element `i` depends on element
+    `i + d/2`, so a kernel cannot process the row in independent chunks the way silu
+    can. That coupling across half the row is the whole difficulty, and it is why a
+    naive port of an elementwise kernel produces plausible-looking garbage.
+
+    `cos` and `sin` are supplied rather than computed, which is what an inference engine
+    does -- they depend only on position and are cached across the whole forward pass.
+    """
+    half = cols // 2
+    x = make_input((rows, cols), seed, dev, dtype=dt)
+    # Real angles, so cos and sin are correlated the way they are in practice rather
+    # than being two unrelated random tensors.
+    gen = torch.Generator(device=dev).manual_seed(seed ^ 0xC0DE)
+    angle = torch.rand((rows, half), generator=gen, device=dev, dtype=torch.float32) * 6.2831853
+    cos = angle.cos().to(dt)
+    sin = angle.sin().to(dt)
+
+    def _ref() -> torch.Tensor:
+        xd, cd, sd = x.double(), cos.double(), sin.double()
+        lo, hi = xd[:, :half], xd[:, half:]
+        return torch.cat((lo * cd - hi * sd, hi * cd + lo * sd), dim=-1)
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"x": x, "cos": cos, "sin": sin},
+        out=torch.empty_like(x),
+        meta={"rows": rows, "cols": cols, "half": half},
+        reference=ref,
+        recompute=_ref,
+        # x and out in full, cos and sin are half a row each.
+        bytes_moved=3.0 * n * dt.itemsize,
+        flops=6.0 * n,
+        working_set_bytes=3.0 * n * dt.itemsize,
+        rel_tol=accumulation_tolerance(1, dt=dt),
+    )
+
+
+def _gather(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """Row gather: out[i] = table[idx[i]]. Embedding lookup, KV-cache reads, MoE routing.
+
+    KernelBenchX's Index category, which it describes as dominated by address
+    calculation rather than arithmetic, and the access pattern behind three of the
+    hottest kernels in inference serving.
+
+    Interesting for the harness rather than only for the kernel. Every other op here
+    streams, so peak bandwidth is a reachable target and 90% means a good kernel. A
+    random gather cannot reach it at any quality: rows are 512 bytes here, so each one
+    is four sectors fetched from an unpredictable place, and the achievable fraction of
+    peak is set by the access pattern, not by the code. The number this op produces is
+    therefore low for an honest kernel, and that is the correct answer -- which is worth
+    having in the set precisely because it stops 90% being read as the pass mark.
+
+    `bytes_moved` counts the compulsory traffic: the *distinct* rows touched, once each,
+    plus the write. Not what the memory system really moves, which is higher, because
+    the harness should charge an op for the work it requires rather than for the
+    hardware's granularity.
+
+    Counting the distinct rows is not a refinement, it is the difference between this op
+    being gradable and not. Indices are drawn with replacement, so about 1 - 1/e of the
+    rows are distinct and the rest are repeats that the cache serves. Charging for all
+    of them overstated the traffic by a fifth, and a correct Triton kernel came out at
+    **95.5% of the memory bus** -- refused by the roofline gate as pointing at the
+    measurement rather than the kernel. Which it did: the kernel was fine and the cost
+    model was wrong.
+    """
+    table = make_input((rows, cols), seed, dev, dtype=dt)
+    gen = torch.Generator(device=dev).manual_seed(seed ^ 0x1DEA)
+    # With replacement, so the pattern is irregular *and* has repeats, which is what an
+    # embedding lookup or MoE route actually looks like.
+    idx = torch.randint(0, rows, (rows,), generator=gen, device=dev, dtype=torch.int64)
+    distinct = int(torch.unique(idx).numel())
+
+    def _ref() -> torch.Tensor:
+        return table.double()[idx]
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"table": table, "idx": idx},
+        out=torch.empty_like(table),
+        meta={"rows": rows, "cols": cols},
+        reference=ref,
+        recompute=_ref,
+        # Distinct rows read once, every row written.
+        bytes_moved=float((distinct + rows) * cols * dt.itemsize),
+        flops=0.0,
+        working_set_bytes=float((distinct + rows) * cols * dt.itemsize),
+        # A gather moves data without touching it: bit-exact, like transpose.
+        rel_tol=0.0,
+    )
+
+
+def _cross_entropy(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """Per-row cross entropy from logits, unreduced. KernelBenchX's Loss category.
+
+    The one op here whose output is smaller than its input: a row of `cols` logits
+    collapses to a single number, so there is nowhere for an error to average out. A
+    softmax that drifts slightly is still a plausible softmax; a loss that drifts is
+    the training signal.
+
+    A note on the max subtraction, because the obvious claim about it is false here and
+    it was worth measuring rather than asserting. Every real implementation shifts by
+    the row maximum before exponentiating, and the usual justification is overflow --
+    but at this input range it does not overflow: logits span +/-80, the largest row sum
+    of exponentials is 4.3e35, and fp32 holds up to 3.4e38. A kernel that skips the
+    shift is admitted here, correctly, because its answer is right.
+
+    What does break is the *scope* of the reduction, which is what KernelBenchX reports
+    for its Reduce category: a kernel that shifts each tile by that tile's own maximum
+    and then adds the partial sums is combining quantities scaled differently, and the
+    result is wrong by a factor nothing in the code looks suspicious about. That is what
+    `cheat_blockwise_cross_entropy.py` does.
+
+    The output is one number a row, which is the reason this op is here at all. A
+    softmax that drifts slightly is still a plausible softmax; a loss that drifts is the
+    training signal, and there is no averaging left to hide it in.
+    """
+    logits = make_input((rows, cols), seed, dev, dtype=dt)
+    gen = torch.Generator(device=dev).manual_seed(seed ^ 0x105E)
+    target = torch.randint(0, cols, (rows,), generator=gen, device=dev, dtype=torch.int64)
+
+    def _ref() -> torch.Tensor:
+        ld = logits.double()
+        return torch.nn.functional.cross_entropy(ld, target, reduction="none")
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"logits": logits, "target": target},
+        # One loss per row, in the accumulation precision rather than the storage one:
+        # a bf16 scalar loss would quantise the answer below any useful tolerance.
+        out=torch.empty((rows,), device=dev, dtype=torch.float32),
+        meta={"rows": rows, "cols": cols},
+        reference=ref,
+        recompute=_ref,
+        # Logits read; the output is one float a row, which rounds to nothing beside it.
+        bytes_moved=float(n * dt.itemsize + rows * 4),
+        flops=5.0 * n,
+        working_set_bytes=float(n * dt.itemsize + rows * 4),
+        rel_tol=accumulation_tolerance(cols, dt=dt),
+    )
+
+
+def _attention_causal(seq: int, head_dim: int, seed: int, dev: torch.device,
+                      dt: torch.dtype) -> Problem:
+    """Causal attention: the mask every autoregressive model runs under.
+
+    A separate op rather than a flag, because the mask changes the cost model. Only the
+    lower triangle is computed, so the work is seq*(seq+1)/2 score entries instead of
+    seq^2 -- almost exactly half, and `flops` says so. Charging the full seq^2 would
+    make a correct kernel look twice as fast as it is, the same class of error as the
+    gather cost model.
+
+    Kernel-side, half the tiles can be skipped outright and only the tiles straddling
+    the diagonal need an element-wise mask. A kernel that masks every tile instead is
+    equally correct and close to twice the work, which is exactly the difference a
+    speed claim ought to be able to distinguish.
+
+    Also the harness's worst case for TF32: a row near the start attends to one or two
+    keys, so operand quantisation gets no averaging at all -- see quantisation_safety.
+    """
+    batch, heads = 4, 8
+    shape = (batch, heads, seq, head_dim)
+    q = make_input(shape, seed, dev, exponent_range=0, dtype=dt)
+    k = make_input(shape, seed ^ 0xA11, dev, exponent_range=0, dtype=dt)
+    v = make_input(shape, seed ^ 0xB22, dev, exponent_range=0, dtype=dt)
+
+    def _ref() -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.double(), k.double(), v.double(), is_causal=True
+        )
+
+    ref = _ref()
+    elements = batch * heads * seq * head_dim
+    pairs = seq * (seq + 1) // 2
+    return Problem(
+        label=f"b{batch}h{heads}s{seq}d{head_dim}",
+        inputs={"q": q, "k": k, "v": v},
+        out=torch.empty(shape, device=dev, dtype=dt),
+        meta={"batch": batch, "heads": heads, "seq": seq, "head_dim": head_dim,
+              "causal": True},
+        reference=ref,
+        recompute=_ref,
+        bytes_moved=float(4 * elements * dt.itemsize),
+        flops=4.0 * batch * heads * pairs * head_dim,
+        working_set_bytes=float(4 * elements * dt.itemsize),
+        rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=48.0,
+    )
+
+
+def _attention_decode(seq: int, head_dim: int, seed: int, dev: torch.device,
+                      dt: torch.dtype) -> Problem:
+    """Decode attention: one query against a KV cache. The other side of the ridge point.
+
+    Every other attention op here is prefill -- seq queries against seq keys, which is
+    compute-bound and audited against the arithmetic ceiling. Generation is not. A single
+    query token attends to the whole cache, so the work is O(seq * d) while the traffic
+    is also O(seq * d): arithmetic intensity is about 0.5 FLOP/byte against a ridge point
+    near 82, which puts it decisively on the memory side.
+
+    That makes it the most useful attention shape here for the harness itself. Same
+    operation family, same reference, and the roofline gate selects a different ceiling
+    for it without being told -- which is the property that lets one schema cover
+    fourteen operations.
+
+    It is also where the real kernels live: this is what paged attention and
+    FlashDecoding exist to optimise, and the reason is visible in the shape. There are
+    only batch*heads = 32 units of parallelism against 128 SMs, so a kernel assigning one
+    program per head leaves most of the GPU idle however well it streams. Splitting the
+    cache across programs and combining the partial softmax states afterwards is
+    precisely FlashDecoding.
+    """
+    batch, heads = 4, 8
+    kv_shape = (batch, heads, seq, head_dim)
+    q_shape = (batch, heads, 1, head_dim)
+    q = make_input(q_shape, seed, dev, exponent_range=0, dtype=dt)
+    k = make_input(kv_shape, seed ^ 0xA11, dev, exponent_range=0, dtype=dt)
+    v = make_input(kv_shape, seed ^ 0xB22, dev, exponent_range=0, dtype=dt)
+
+    def _ref() -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.double(), k.double(), v.double()
+        )
+
+    ref = _ref()
+    cache_elements = batch * heads * seq * head_dim
+    query_elements = batch * heads * head_dim
+    return Problem(
+        label=f"b{batch}h{heads}s{seq}d{head_dim}",
+        inputs={"q": q, "k": k, "v": v},
+        out=torch.empty(q_shape, device=dev, dtype=dt),
+        meta={"batch": batch, "heads": heads, "seq": seq, "head_dim": head_dim,
+              "decode": True},
+        reference=ref,
+        recompute=_ref,
+        bytes_moved=float((2 * cache_elements + 2 * query_elements) * dt.itemsize),
+        flops=4.0 * batch * heads * seq * head_dim,
+        working_set_bytes=float((2 * cache_elements + 2 * query_elements) * dt.itemsize),
+        rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=48.0,
+    )
+
+
+def _attention_gqa(seq: int, head_dim: int, seed: int, dev: torch.device,
+                   dt: torch.dtype) -> Problem:
+    """Grouped-query attention: 32 query heads sharing 8 KV heads, as Llama 3 ships it.
+
+    The reason GQA exists is a traffic asymmetry, and that asymmetry is the whole
+    difficulty for a kernel. Query and output are full width; K and V are a quarter of
+    it. So the arithmetic is identical to multi-head attention -- every query head still
+    attends over the whole sequence -- while the KV traffic is divided by the group size,
+    which is what shrinks the cache during generation.
+
+    A kernel gets this wrong in one of two ways, and the harness can tell them apart.
+    Materialising the expansion with a `repeat_interleave` before the attention is
+    correct and throws the entire benefit away: it reads each KV head four times and the
+    measured bandwidth reflects it. Indexing the shared KV head from four query programs
+    instead keeps the traffic where GQA promises it, and the compulsory-traffic model
+    below charges the shared reads once, so a kernel that expands cannot hide behind a
+    cost model that already assumed it did.
+    """
+    batch, heads_q, heads_kv = 4, 32, 8
+    group = heads_q // heads_kv
+    q_shape = (batch, heads_q, seq, head_dim)
+    kv_shape = (batch, heads_kv, seq, head_dim)
+    q = make_input(q_shape, seed, dev, exponent_range=0, dtype=dt)
+    k = make_input(kv_shape, seed ^ 0xA11, dev, exponent_range=0, dtype=dt)
+    v = make_input(kv_shape, seed ^ 0xB22, dev, exponent_range=0, dtype=dt)
+
+    def _ref() -> torch.Tensor:
+        # Expanded explicitly rather than via enable_gqa, so the reference does not
+        # depend on which torch version is installed.
+        kd = k.double().repeat_interleave(group, dim=1)
+        vd = v.double().repeat_interleave(group, dim=1)
+        return torch.nn.functional.scaled_dot_product_attention(q.double(), kd, vd)
+
+    ref = _ref()
+    q_elements = batch * heads_q * seq * head_dim
+    kv_elements = batch * heads_kv * seq * head_dim
+    return Problem(
+        label=f"b{batch}h{heads_q}kv{heads_kv}s{seq}d{head_dim}",
+        inputs={"q": q, "k": k, "v": v},
+        out=torch.empty(q_shape, device=dev, dtype=dt),
+        meta={"batch": batch, "heads_q": heads_q, "heads_kv": heads_kv,
+              "group": group, "seq": seq, "head_dim": head_dim},
+        reference=ref,
+        recompute=_ref,
+        # q and o at full width, k and v at a quarter of it, each read once.
+        bytes_moved=float((2 * q_elements + 2 * kv_elements) * dt.itemsize),
+        # Every query head attends over the whole sequence, so the arithmetic is the
+        # same as multi-head attention. Only the traffic shrinks.
+        flops=4.0 * batch * heads_q * seq * seq * head_dim,
+        working_set_bytes=float((2 * q_elements + 2 * kv_elements) * dt.itemsize),
+        rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=48.0,
+    )
+
+
+def _moe_gemm(tokens: int, hidden: int, seed: int, dev: torch.device,
+              dt: torch.dtype) -> Problem:
+    """Grouped GEMM for a mixture of experts: out[i] = x[i] @ w[expert[i]].
+
+    The kernel a sparse model spends most of its time in, and the one where the
+    difficulty is neither the arithmetic nor the memory pattern but the *grouping*. Each
+    token needs a different weight matrix, so there is no single GEMM to write. The
+    standard shape of a solution is permute, grouped GEMM, unpermute: sort the tokens by
+    expert so each tile of the output is a contiguous run against one weight matrix, do
+    the multiplication, then scatter the rows back.
+
+    Compute-bound at these sizes -- intensity is around 128 FLOP/byte against a ridge
+    point near 82 -- so it is audited against the arithmetic ceiling. The traffic model
+    charges every expert's weights once, because with tokens spread over eight experts
+    all of them are touched, and charges x and the output once each.
+
+    The routing is uniform-random rather than skewed. Real routers are not, and load
+    imbalance is a large part of why MoE kernels are hard, but a skewed distribution
+    would make the arithmetic per expert data-dependent and the FLOP count would stop
+    being a property of the shape. Uniform keeps the cost model exact, which the gather
+    op already demonstrated matters more than realism in a benchmark.
+    """
+    experts = 8
+    n = hidden
+    x = make_input((tokens, hidden), seed, dev, exponent_range=0, dtype=dt)
+    w = make_input((experts, hidden, n), seed ^ 0xE0E0, dev, exponent_range=0, dtype=dt)
+    gen = torch.Generator(device=dev).manual_seed(seed ^ 0x3EE7)
+    expert = torch.randint(0, experts, (tokens,), generator=gen, device=dev,
+                           dtype=torch.int64)
+
+    def _ref() -> torch.Tensor:
+        xd, wd = x.double(), w.double()
+        result = torch.empty((tokens, n), device=dev, dtype=torch.float64)
+        for e in range(experts):
+            rows = expert == e
+            if bool(rows.any()):
+                result[rows] = xd[rows] @ wd[e]
+        return result
+
+    ref = _ref()
+    return Problem(
+        label=f"t{tokens}h{hidden}e{experts}",
+        inputs={"x": x, "w": w, "expert": expert},
+        out=torch.empty((tokens, n), device=dev, dtype=dt),
+        meta={"tokens": tokens, "hidden": hidden, "n": n, "experts": experts},
+        reference=ref,
+        recompute=_ref,
+        # x once, every expert's weights once, the output once.
+        bytes_moved=float((tokens * hidden + experts * hidden * n + tokens * n) * dt.itemsize),
+        # One GEMM row per token, whichever expert it lands on.
+        flops=2.0 * tokens * hidden * n,
+        working_set_bytes=float((tokens * hidden + experts * hidden * n + tokens * n) * dt.itemsize),
+        rel_tol=accumulation_tolerance(hidden, dt=dt),
+    )
+
+
+def _attention_paged(seq: int, head_dim: int, seed: int, dev: torch.device,
+                     dt: torch.dtype) -> Problem:
+    """Paged decode attention: the KV cache lives in scattered fixed-size blocks.
+
+    The kernel a serving stack is built around. Instead of a contiguous cache per
+    sequence, the pool is a flat array of `block_size`-position blocks and each sequence
+    owns a list of physical block indices -- a block table. That is what lets a server
+    grow a sequence without reserving its maximum length up front, and it is why the
+    kernel cannot simply stream.
+
+    Two of this harness's op families in one: the arithmetic and the softmax are decode
+    attention, and the addressing is `gather`. A kernel walks the block table, resolves
+    each logical block to a physical one, and streams 16 positions at a time from an
+    unpredictable place in the pool.
+
+    Memory-bound like ordinary decode -- intensity around 0.5 FLOP/byte -- but the
+    indirection puts a floor under how well it can stream that plain decode does not
+    have. The blocks are laid out as a random permutation of the pool, so consecutive
+    logical blocks are nowhere near each other, and 16 positions of one head is 8 KB:
+    large enough to be a real burst, small enough that the scatter is not amortised away.
+
+    Sequence lengths are uniform. Real serving is ragged, and the imbalance is a genuine
+    part of why these kernels are hard, but ragged lengths would make the FLOP count
+    data-dependent rather than a property of the shape -- the same reason the MoE routing
+    here is uniform.
+    """
+    batch, heads = 4, 8
+    block_size = 16
+    assert seq % block_size == 0, "sequence must divide into whole blocks"
+    blocks_per_seq = seq // block_size
+    # A pool with slack, so physical blocks are genuinely scattered rather than a
+    # sequence-ordered layout that happens to be contiguous.
+    pool_blocks = int(batch * blocks_per_seq * 1.25)
+
+    q = make_input((batch, heads, 1, head_dim), seed, dev, exponent_range=0, dtype=dt)
+    k_cache = make_input((pool_blocks, block_size, heads, head_dim), seed ^ 0xA11, dev,
+                         exponent_range=0, dtype=dt)
+    v_cache = make_input((pool_blocks, block_size, heads, head_dim), seed ^ 0xB22, dev,
+                         exponent_range=0, dtype=dt)
+
+    gen = torch.Generator(device=dev).manual_seed(seed ^ 0x9A6E)
+    # A permutation, so every sequence gets distinct blocks and the traffic model is
+    # exact: each block is read once and only once.
+    chosen = torch.randperm(pool_blocks, generator=gen, device=dev)[: batch * blocks_per_seq]
+    block_table = chosen.view(batch, blocks_per_seq).to(torch.int32)
+
+    def _ref() -> torch.Tensor:
+        # (batch, blocks, block_size, heads, head_dim) -> (batch, heads, seq, head_dim)
+        kg = k_cache.double()[block_table.long()]
+        vg = v_cache.double()[block_table.long()]
+        kg = kg.permute(0, 3, 1, 2, 4).reshape(batch, heads, seq, head_dim)
+        vg = vg.permute(0, 3, 1, 2, 4).reshape(batch, heads, seq, head_dim)
+        return torch.nn.functional.scaled_dot_product_attention(q.double(), kg, vg)
+
+    ref = _ref()
+    cache_elements = batch * heads * seq * head_dim
+    query_elements = batch * heads * head_dim
+    return Problem(
+        label=f"b{batch}h{heads}s{seq}d{head_dim}bs{block_size}",
+        inputs={"k_cache": k_cache, "v_cache": v_cache, "q": q,
+                "block_table": block_table},
+        out=torch.empty((batch, heads, 1, head_dim), device=dev, dtype=dt),
+        meta={"batch": batch, "heads": heads, "seq": seq, "head_dim": head_dim,
+              "block_size": block_size, "blocks_per_seq": blocks_per_seq,
+              "pool_blocks": pool_blocks},
+        reference=ref,
+        recompute=_ref,
+        # Only the blocks this batch owns are touched, once each, plus q and o.
+        bytes_moved=float((2 * cache_elements + 2 * query_elements) * dt.itemsize),
+        flops=4.0 * batch * heads * seq * head_dim,
+        working_set_bytes=float((2 * cache_elements + 2 * query_elements) * dt.itemsize),
+        rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=48.0,
+    )
+
+
+def _attention_backward(seq: int, head_dim: int, seed: int, dev: torch.device,
+                        dt: torch.dtype) -> Problem:
+    """Attention backward: dQ, dK and dV from Q, K, V and dO.
+
+    Training's half of attention, and roughly two and a half times the arithmetic of the
+    forward pass, so it is where a training step actually spends its attention budget.
+    It is also the only op here with more than one output, which the harness's
+    single-tensor contract handles by stacking them: `out` is (3, batch, heads, seq,
+    head_dim) holding dQ, dK, dV. That is not a dodge -- a kernel has to produce all
+    three consistently, and stacking means a candidate that gets dV right and dK wrong
+    cannot pass on average.
+
+    The difficulty a Flash backward exists to solve is that dQ, dK and dV all need the
+    attention probabilities P, which the forward pass did not keep. A materialising
+    implementation stores the seq x seq matrix and reads it back; a Flash implementation
+    recomputes S tile by tile from Q and K and never writes it. Both do the same
+    arithmetic and the traffic differs by O(seq^2), so `flops` here counts the recompute
+    -- ten seq^2 terms per head rather than eight -- and `bytes_moved` counts only the
+    four inputs and three outputs. A kernel that materialises therefore moves more than
+    it is charged for and measures slower, which is the honest way round.
+
+    dV = P^T dO, dP = dO V^T, dS = P * (dP - rowsum(dP * P)), dQ = dS K, dK = dS^T Q.
+    The rowsum term is the softmax Jacobian and is the part that couples the whole row,
+    which is why a backward kernel cannot be tiled as freely as a forward one.
+    """
+    batch, heads = 4, 8
+    shape = (batch, heads, seq, head_dim)
+    q = make_input(shape, seed, dev, exponent_range=0, dtype=dt)
+    k = make_input(shape, seed ^ 0xA11, dev, exponent_range=0, dtype=dt)
+    v = make_input(shape, seed ^ 0xB22, dev, exponent_range=0, dtype=dt)
+    do = make_input(shape, seed ^ 0xD00, dev, exponent_range=0, dtype=dt)
+
+    def _ref() -> torch.Tensor:
+        # Fresh leaves each time: recompute is called again after the timed samples
+        # have rotated an input, and autograd will not reuse a graph.
+        qd = q.double().detach().requires_grad_(True)
+        kd = k.double().detach().requires_grad_(True)
+        vd = v.double().detach().requires_grad_(True)
+        o = torch.nn.functional.scaled_dot_product_attention(qd, kd, vd)
+        o.backward(do.double())
+        return torch.stack((qd.grad, kd.grad, vd.grad))
+
+    ref = _ref()
+    elements = batch * heads * seq * head_dim
+    return Problem(
+        label=f"b{batch}h{heads}s{seq}d{head_dim}",
+        inputs={"q": q, "k": k, "v": v, "do": do},
+        out=torch.empty((3,) + shape, device=dev, dtype=dt),
+        meta={"batch": batch, "heads": heads, "seq": seq, "head_dim": head_dim},
+        reference=ref,
+        recompute=_ref,
+        # q, k, v, do read; dq, dk, dv written.
+        bytes_moved=float(7 * elements * dt.itemsize),
+        # Counted as the arithmetic the operation requires given these inputs, in units
+        # of 2*b*h*s*s*d:
+        #
+        #   forward recompute for L and D   S (2) + P V (2)  = 4
+        #   dk/dv pass                      S (2) + dV (2) + dP (2) + dK (2) = 8
+        #   dq, fused into that pass        dQ (2)           = 2
+        #                                                     --
+        #                                                     14
+        #
+        # The forward recompute is not optional here. A training step saves `O` and the
+        # row logsumexp from its forward pass and a real backward kernel is handed them;
+        # this op is given only Q, K, V and dO, so recovering them is part of the work
+        # and charging for it is the difference between grading the kernel and grading
+        # the calling convention.
+        #
+        # 14 rather than 18 on purpose. Recomputing S in a third pass to get dQ is what
+        # a straightforward implementation does -- triton_attention_backward.py does
+        # exactly that -- but folding dQ into the dk/dv pass with atomics needs only two
+        # recomputes. Charging the cheaper figure means the third pass shows up as a
+        # lower number rather than being absorbed into the model.
+        flops=14.0 * batch * heads * seq * seq * head_dim,
+        working_set_bytes=float(7 * elements * dt.itemsize),
+        rel_tol=accumulation_tolerance(seq, safety=8.0, dt=dt),
+        quantisation_safety=48.0,
     )
 
 
@@ -308,6 +1024,22 @@ OPS: dict[str, tuple[Callable[..., Problem], tuple[tuple[int, int], ...]]] = {
     "transpose": (_transpose, ((512, 2048), (1024, 4096), (4096, 4096), (8192, 4096), (16384, 4096))),
     "matmul": (_matmul, ((512, 512), (1024, 1024), (2048, 2048), (4096, 4096))),
     "attention": (_attention, ((512, 64), (1024, 64), (2048, 64), (1024, 128))),
+    "layernorm": (_layernorm, ((512, 2048), (1024, 4096), (4096, 4096), (8192, 4096), (16384, 4096))),
+    "swiglu": (_swiglu, ((512, 2048), (1024, 4096), (4096, 4096), (8192, 4096), (16384, 4096))),
+    "quantize": (_quantize, ((512, 2048), (1024, 4096), (4096, 4096), (8192, 4096), (16384, 4096))),
+    # Head-dim widths, since that is what RoPE actually sees; rows sweep past 2x L2.
+    "rope": (_rope, ((4096, 128), (16384, 128), (65536, 128), (131072, 128), (262144, 128))),
+    # Rows of 512 bytes: wide enough that a gathered row is several sectors, narrow
+    # enough that the irregularity is not amortised away.
+    "gather": (_gather, ((8192, 128), (32768, 128), (131072, 128), (262144, 128))),
+    "cross_entropy": (_cross_entropy, ((4096, 4096), (8192, 4096), (16384, 4096), (32768, 4096))),
+    "attention_causal": (_attention_causal, ((512, 64), (1024, 64), (2048, 64), (1024, 128))),
+    # Cache lengths, not prefill lengths: long enough that K and V clear 2x L2.
+    "attention_decode": (_attention_decode, ((2048, 128), (8192, 128), (16384, 128), (32768, 128))),
+    "attention_gqa": (_attention_gqa, ((512, 128), (1024, 128), (2048, 128))),
+    "moe_gemm": (_moe_gemm, ((2048, 1024), (4096, 1024), (8192, 1024), (4096, 2048))),
+    "attention_paged": (_attention_paged, ((2048, 128), (4096, 128), (8192, 128))),
+    "attention_backward": (_attention_backward, ((512, 64), (1024, 64), (2048, 64), (1024, 128))),
 }
 
 
@@ -361,23 +1093,74 @@ def deviation(got: torch.Tensor, want: torch.Tensor, rel_tol: float) -> tuple[fl
     return max_abs, max_rel, violation, has_nonfinite
 
 
+_NVML_CLOCK_SM = 1
+_nvml_handle: Any = None
+_nvml_lib: Any = None
+_nvml_tried = False
+
+
+def _nvml() -> tuple[Any, Any]:
+    """NVML through ctypes, initialised once. Returns (lib, handle) or (None, None).
+
+    Not `torch.cuda.clock_rate()`: that routes through pynvml, which is not in the
+    sandbox image, so it raised and the clock was silently recorded as None on every
+    run. Two gate notes depend on this value -- the roofline throttle warning and the
+    variance gate's kernel-versus-machine attribution -- so a silent None disabled
+    both of them without anything failing.
+
+    `libnvidia-ml.so.1` needs no package: it arrives with the driver, and the
+    container runtime mounts it alongside the device nodes.
+    """
+    global _nvml_handle, _nvml_lib, _nvml_tried
+    if _nvml_tried:
+        return _nvml_lib, _nvml_handle
+    _nvml_tried = True
+    try:
+        lib = ctypes.CDLL("libnvidia-ml.so.1")
+        if lib.nvmlInit_v2() != 0:
+            return None, None
+        handle = ctypes.c_void_p()
+        index = torch.cuda.current_device()
+        if lib.nvmlDeviceGetHandleByIndex_v2(ctypes.c_int(index), ctypes.byref(handle)) != 0:
+            return None, None
+        _nvml_lib, _nvml_handle = lib, handle
+    except Exception:
+        _nvml_lib, _nvml_handle = None, None
+    return _nvml_lib, _nvml_handle
+
+
 def current_sm_clock_hz() -> float | None:
     """Actual SM clock right now, or None if it cannot be read.
 
-    Matters because the roofline ceiling is derived from the *maximum* clock. A
-    GPU that is thermally or power throttled never had access to that peak, so a
+    Matters because the roofline ceiling is derived from the *maximum* clock. A GPU
+    that is thermally or power throttled never had access to that peak, so a
     perfectly good kernel measures low and a reader concludes the kernel is bad.
-    Observed here: a sweep run immediately after 900 seconds of sustained
-    autotuning measured roughly a third of the throughput the same kernel reached
-    on an idle device.
+    Observed here: a sweep run immediately after 900 seconds of sustained autotuning
+    measured roughly a third of the throughput the same kernel reached on an idle
+    device.
     """
+    lib, handle = _nvml()
+    if lib is None or handle is None:
+        return None
     try:
-        return float(torch.cuda.clock_rate()) * 1e6  # torch reports MHz
+        mhz = ctypes.c_uint()
+        if lib.nvmlDeviceGetClockInfo(handle, ctypes.c_int(_NVML_CLOCK_SM), ctypes.byref(mhz)) != 0:
+            return None
+        return float(mhz.value) * 1e6
     except Exception:
         return None
 
 
-def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[str, Any]:
+def measure_problem(problem: Problem, launch: Callable, repeats: int,
+                    phase_fd: int = -1) -> dict[str, Any]:
+    """Measure one shape. `phase_fd` brackets the timed loop for the supervisor.
+
+    The supervisor cannot see inside this process, but it can see when bytes arrive
+    on a pipe. Writing a marker either side of the timing loop lets it time that
+    loop from outside, which is a far tighter bound than the whole worker lifetime:
+    that includes several seconds of torch import and float64 reference computation,
+    all of which was slack a forged measurement could spend.
+    """
     out = problem.out
 
     # Poison, so a kernel that never writes is visible rather than fast.
@@ -422,9 +1205,40 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
     if 0.0 < pilot_ms < target_sample_ms:
         inner = min(1000, int(target_sample_ms / pilot_ms) + 1)
 
+    # Rotate an input by one element before every sample, so the correct answer is
+    # different every time and nothing computed earlier is still valid.
+    #
+    # Without this, a candidate could compute once and serve the result from cache for
+    # the rest of the timed calls. On a compute-bound op the roofline catches that -- a
+    # cached 4096-cubed GEMM implied 1529 TFLOP/s against an 83 TFLOP/s ceiling. On a
+    # memory-bound op it does not, because a copy moves exactly the traffic the harness
+    # charges: serving rmsnorm from cache was admitted at 89.7% of the bus, against
+    # 25.9% for the honest kernel it replaced.
+    #
+    # A rotation rather than an offset, and that distinction cost a false rejection to
+    # find. Adding a constant shifts the value distribution, which for attention moves
+    # the softmax into a more saturated regime: it raised the measured error 1.7x and
+    # failed a correct TF32 FlashAttention kernel that had been passing at 0.78 of its
+    # bar. A rotation is a permutation, so every output value changes while the
+    # distribution is exactly preserved and no tolerance has to be renegotiated.
+    #
+    # One pass, outside the timed bracket. The candidate cannot know which sample is
+    # the last, and the output is checked against the reference for the final input
+    # state, so every sample has to do the work.
+    drift_key = next(iter(problem.inputs))
+    drift_flat = problem.inputs[drift_key].view(-1)
+
+    if phase_fd >= 0:
+        os.write(phase_fd, b"B")
+
     samples: list[float] = []
     clocks: list[float] = []
-    for _ in range(repeats):
+    for rep in range(repeats):
+        drift_flat.copy_(torch.roll(drift_flat, 1))
+        # Drain it before starting the clock. The rotation is a device op and without
+        # this it is still in flight when timing begins, so the kernel is charged for
+        # it -- measured at about 17 percentage points of apparent bandwidth.
+        torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(inner):
             launch(problem.inputs, out, problem.meta)
@@ -433,6 +1247,9 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
         clock = current_sm_clock_hz()
         if clock:
             clocks.append(clock)
+
+    if phase_fd >= 0:
+        os.write(phase_fd, b"E")
 
     # Revalidate what the last *measured* call produced.
     #
@@ -443,8 +1260,11 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
     # admitted. So the non-finite flag from this comparison is reported rather than
     # discarded, which is all it took -- it was already being computed.
     timed_written = bool(torch.isfinite(out).any().item())
+    # Against the reference for the *drifted* input, not the original: that is what
+    # makes a cached answer detectably stale.
+    timed_reference = problem.recompute()
     _, timed_rel, timed_violation, timed_nonfinite = deviation(
-        out, problem.reference, problem.rel_tol
+        out, timed_reference, problem.rel_tol
     )
 
     ordered = sorted(samples)
@@ -474,6 +1294,7 @@ def measure_problem(problem: Problem, launch: Callable, repeats: int) -> dict[st
         "timed_max_rel_err": timed_rel,
         "timed_violation": timed_violation,
         "rel_tol": problem.rel_tol,
+        "quantisation_safety": problem.quantisation_safety,
         "bytes_moved": problem.bytes_moved,
         "flops": problem.flops,
         "working_set_bytes": problem.working_set_bytes,
@@ -536,7 +1357,7 @@ def load_candidate(path: str) -> Callable:
     return launch
 
 
-def run_worker(args: argparse.Namespace, result_fd: int) -> int:
+def run_worker(args: argparse.Namespace, result_fd: int, phase_fd: int = -1) -> int:
     """Measure the candidate and report on a file descriptor. Untrusted.
 
     This is the only process that imports candidate code, and it is deliberately
@@ -564,7 +1385,7 @@ def run_worker(args: argparse.Namespace, result_fd: int) -> int:
     shapes_out = []
     for index, dims in enumerate(shapes):
         problem = builder(dims[0], dims[1], args.seed + index, dev, dt)
-        record = measure_problem(problem, launch, payload["repeats"])
+        record = measure_problem(problem, launch, payload["repeats"], phase_fd)
         # The schema names these rows/cols for compatibility with the CUDA
         # harness; they are labels, and ops with other layouts report their own.
         record["rows"], record["cols"] = dims
@@ -591,6 +1412,13 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument("--seed", type=int, default=20260826)
     parser.add_argument(
+        "--phase-fd",
+        type=int,
+        default=-1,
+        help="Descriptor to bracket each timed loop on, so the supervisor can time "
+             "the measurement from outside this process.",
+    )
+    parser.add_argument(
         "--result-fd",
         type=int,
         required=True,
@@ -604,7 +1432,7 @@ def main() -> int:
              "Sets both the correctness tolerance and which hardware ceiling binds.",
     )
     args = parser.parse_args()
-    return run_worker(args, args.result_fd)
+    return run_worker(args, args.result_fd, args.phase_fd)
 
 
 if __name__ == "__main__":

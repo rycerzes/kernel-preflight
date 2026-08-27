@@ -2,12 +2,8 @@ import { createLogger } from 'winston';
 import { DockerSandboxProvider } from '../../../../../src/sandbox/docker/provider/DockerSandboxProvider';
 
 /**
- * The reason this provider exists. The bubblewrap-based local provider cannot
- * reach a GPU: bwrap is not setuid, so it always unshares into a user namespace,
- * and the NVIDIA driver refuses to initialise inside one -- `cuInit` returns
- * CUDA_ERROR_OPERATING_SYSTEM however widely the read policy is opened. A
- * container gets a GPU through the container toolkit, which is what the toolkit
- * is for.
+ * Proves `gpus` actually reaches the device, by compiling and running a kernel and
+ * checking the bandwidth it reports, rather than trusting that `--gpus` was passed.
  *
  * Skipped unless a GPU host is present, so it is safe in CI.
  */

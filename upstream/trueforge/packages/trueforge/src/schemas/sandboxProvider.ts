@@ -75,7 +75,7 @@ export const DockerSandboxProviderSchema = z
       .min(1)
       .optional()
       .describe(
-        'Value passed to `--gpus`, e.g. `all` or `device=0`. Omit for no GPU. Required for CUDA workloads: the bubblewrap-based local provider cannot expose a GPU because the NVIDIA driver refuses to initialise inside a user namespace.',
+        'Value passed to `--gpus`, e.g. `all` or `device=0`. Omit for no GPU.',
       ),
     extra_run_args: z
       .array(z.string())

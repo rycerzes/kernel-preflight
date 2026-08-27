@@ -18,7 +18,18 @@ from __future__ import annotations
 
 import pytest
 
-from preflight.gates import TF32_TOLERANCE, GateStatus, check_correctness, _violation_scale
+from preflight.gates import (
+    DEFAULT_QUANTISATION_SAFETY,
+    TF32_UNIT_ROUNDOFF,
+    GateStatus,
+    check_correctness,
+    _violation_scale,
+)
+
+# The bar for an op that does not override it.
+TF32_BAR = DEFAULT_QUANTISATION_SAFETY * TF32_UNIT_ROUNDOFF
+# Attention family: shallow rows get no averaging, so the harness reports 48.
+ATTENTION_BAR = 48.0 * TF32_UNIT_ROUNDOFF
 
 # (k, harness rel_tol at that depth, violation measured for a real TF32 matmul)
 MEASURED = [(512, 2.15e-5, 62.6429), (1024, 3.05e-5, 47.3670),
@@ -29,7 +40,7 @@ def test_tf32_bar_is_flat_in_absolute_terms() -> None:
     """The whole point: one tolerance, whatever the reduction depth."""
     for _, rel_tol, _ in MEASURED:
         scale = _violation_scale({"precision": "tf32"}, {"rel_tol": rel_tol})
-        assert scale * rel_tol == pytest.approx(TF32_TOLERANCE, rel=1e-9)
+        assert scale * rel_tol == pytest.approx(TF32_BAR, rel=1e-9)
 
 
 def test_tf32_scale_shrinks_with_depth() -> None:
@@ -54,12 +65,61 @@ def test_a_sloppier_tf32_kernel_is_rejected() -> None:
     assert (violation * 3) / scale > 1.0
 
 
+def test_attention_gets_its_own_wider_bar() -> None:
+    """The harness reports the factor; the gate must use it rather than a constant."""
+    shape = {"rel_tol": 4.32e-05, "quantisation_safety": 48.0}
+    scale = _violation_scale({"precision": "tf32"}, shape)
+    assert scale * shape["rel_tol"] == pytest.approx(ATTENTION_BAR, rel=1e-9)
+    assert scale > _violation_scale({"precision": "tf32"}, {"rel_tol": 4.32e-05})
+
+
 def test_old_multiplicative_scale_would_have_waved_that_through() -> None:
     """Shows the bug mattered, rather than merely existed."""
     _, rel_tol, violation = MEASURED[-1]
     assert (violation * 3) / 8192.0 < 1.0
     # It would have taken a ~130x-worse kernel to trip the old bar.
     assert 8192.0 / _violation_scale({"precision": "tf32"}, {"rel_tol": rel_tol}) == pytest.approx(128.0, rel=0.01)
+
+
+# Measured on causal FlashAttention at tf32: the shallowest rows attend to one or two
+# keys, so operand quantisation gets no averaging and the error is ~9x the non-causal
+# case. This is the worst case the flat bar has to accommodate.
+CAUSAL_ATTENTION = [(512, 2.16e-05, 266.0), (1024, 3.05e-05, 199.1),
+                    (2048, 4.32e-05, 201.5)]
+
+
+def test_causal_attention_is_not_falsely_rejected() -> None:
+    """The regression: on the flat factor of 8 this kernel failed at up to 2.2x."""
+    for seq, rel_tol, violation in CAUSAL_ATTENTION:
+        shape = {"rel_tol": rel_tol, "quantisation_safety": 48.0}
+        normalised = violation / _violation_scale({"precision": "tf32"}, shape)
+        assert normalised < 1.0, f"seq={seq} rejected at {normalised:.2f}x"
+
+
+def test_it_would_have_been_rejected_on_the_flat_bar() -> None:
+    """Shows the per-op factor mattered rather than merely existed."""
+    seq, rel_tol, violation = CAUSAL_ATTENTION[-1]
+    flat = _violation_scale({"precision": "tf32"}, {"rel_tol": rel_tol})
+    assert violation / flat > 1.0
+
+
+# torch's own TF32 causal attention on the same shape, as the reference point the bar
+# is calibrated against rather than the kernels in this repository.
+TORCH_TF32_CAUSAL = (2048, 4.32e-05, 185.8)
+
+
+def test_a_reference_implementation_sits_well_inside_the_bar() -> None:
+    seq, rel_tol, violation = TORCH_TF32_CAUSAL
+    shape = {"rel_tol": rel_tol, "quantisation_safety": 48.0}
+    normalised = violation / _violation_scale({"precision": "tf32"}, shape)
+    assert normalised < 0.5, f"reference at {normalised:.2f}x leaves no room for data spread"
+
+
+def test_the_bar_still_bites_after_widening_for_it() -> None:
+    """Three times a reference implementation must still fail."""
+    seq, rel_tol, violation = TORCH_TF32_CAUSAL
+    shape = {"rel_tol": rel_tol, "quantisation_safety": 48.0}
+    assert (violation * 3) / _violation_scale({"precision": "tf32"}, shape) > 1.0
 
 
 @pytest.mark.parametrize("precision", ["fp32", "bf16", "fp16"])
@@ -71,7 +131,7 @@ def test_other_precisions_are_not_scaled_here(precision: str) -> None:
 def test_tf32_never_tightens_below_the_fp32_bar() -> None:
     """For a reduction deep enough that fp32 accumulation dominates, the wider bar
     is the honest one -- tightening below it would fail correct kernels."""
-    huge = TF32_TOLERANCE * 10
+    huge = TF32_BAR * 10
     assert _violation_scale({"precision": "tf32"}, {"rel_tol": huge}) == 1.0
 
 

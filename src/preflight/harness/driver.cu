@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <limits>
 #include <vector>
 #include <chrono>
@@ -238,6 +239,22 @@ Deviation compare(const std::vector<float>& got, const std::vector<double>& want
 // Clamping loses no information the gates use: every threshold is a comparison
 // against 1.0, so 1e308 and infinity fail identically. NaN clamps to the failing
 // end deliberately, since a NaN error is not a passing one.
+// Rotates one input by a single element before every timed sample, so no answer
+// computed earlier is still correct. See driver.py for why this exists: serving a
+// cached result from the timed calls was admitted at 89.7% of the memory bus on a
+// memory-bound op, because a copy moves exactly the traffic the harness charges and
+// the roofline cannot tell them apart.
+//
+// A rotation rather than an offset: adding a constant shifts the value distribution,
+// which pushed attention's softmax into a more saturated regime and failed a correct
+// TF32 kernel. A permutation changes every output while preserving the distribution
+// exactly.
+__global__ void rotate_kernel(const float* __restrict__ src, float* __restrict__ dst,
+                              long long n) {
+  long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+  if (i < n) dst[(i + 1) % n] = src[i];
+}
+
 double json_double(double v) {
   if (std::isnan(v)) return 1e308;
   if (std::isinf(v)) return v < 0.0 ? -1e308 : 1e308;
@@ -282,7 +299,11 @@ struct ShapeResult {
   double working_set_bytes;
 };
 
-ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned int seed) {
+// `phase_fd` brackets the timed loop so the supervisor can time it from outside this
+// process. See supervisor.py: the whole-process figure carries seconds of setup that a
+// forged measurement could spend, and this removes that slack.
+ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned int seed,
+                    int phase_fd) {
   const size_t count = static_cast<size_t>(rows) * cols;
   const size_t bytes = count * sizeof(float);
   const float eps = 1e-6f;
@@ -365,12 +386,30 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
     inner = wanted > 1000.0 ? 1000 : static_cast<int>(wanted) + 1;
   }
 
+  if (phase_fd >= 0) {
+    const char begin = 'B';
+    ssize_t ignored = write(phase_fd, &begin, 1);
+    (void)ignored;
+  }
+  const int rot_threads = 256;
+  const long long rot_blocks = ((long long)count + rot_threads - 1) / rot_threads;
+  float* d_rot = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_rot, bytes));
   for (int i = 0; i < repeats; ++i) {
+    rotate_kernel<<<(int)rot_blocks, rot_threads>>>(d_x, d_rot, (long long)count);
+    CUDA_CHECK(cudaMemcpy(d_x, d_rot, bytes, cudaMemcpyDeviceToDevice));
+    // Drain before starting the clock, or the kernel under test is charged for it.
+    CUDA_CHECK(cudaDeviceSynchronize());
     auto t0 = std::chrono::steady_clock::now();
     for (int j = 0; j < inner; ++j) launch_candidate(d_x, d_w, d_y, rows, cols, eps, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
     auto t1 = std::chrono::steady_clock::now();
     samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count() / inner);
+  }
+  if (phase_fd >= 0) {
+    const char end = 'E';
+    ssize_t ignored = write(phase_fd, &end, 1);
+    (void)ignored;
   }
   CUDA_CHECK(cudaGetLastError());
 
@@ -381,7 +420,16 @@ ShapeResult measure(const OpSpec& op, int rows, int cols, int repeats, unsigned 
   std::vector<float> h_y_timed(count);
   CUDA_CHECK(cudaMemcpy(h_y_timed.data(), d_y, bytes, cudaMemcpyDeviceToHost));
   bool timed_output_written = std::memcmp(h_y_timed.data(), poison.data(), bytes) != 0;
-  Deviation timed_dev = compare(h_y_timed, h_ref, op.tolerance(rows, cols));
+  CUDA_CHECK(cudaFree(d_rot));
+  // The same permutation the device applied: `repeats` single-element rotations to the
+  // right. A rotation is exact, so host and device agree bit for bit.
+  {
+    const size_t shift = static_cast<size_t>(repeats) % h_x.size();
+    std::rotate(h_x.rbegin(), h_x.rbegin() + static_cast<long>(shift), h_x.rend());
+  }
+  std::vector<double> h_ref_timed(count);
+  op.reference(h_x, h_w, h_ref_timed, rows, cols, eps);
+  Deviation timed_dev = compare(h_y_timed, h_ref_timed, op.tolerance(rows, cols));
 
   std::vector<double> sorted = samples;
   for (size_t i = 1; i < sorted.size(); ++i) {
@@ -467,6 +515,8 @@ int main(int argc, char** argv) {
   // pipe this descriptor refers to, and is the only writer of the verdict. See
   // supervisor.py for what the split does and does not guarantee.
   int result_fd = argc > 5 ? std::atoi(argv[5]) : -1;
+  // Optional: absent when the caller does not want the timed loops bracketed.
+  int phase_fd = argc > 6 ? std::atoi(argv[6]) : -1;
   if (result_fd < 0) {
     std::fprintf(stderr, "no result descriptor given\n");
     return 4;
@@ -519,7 +569,7 @@ int main(int argc, char** argv) {
   std::fprintf(out, "  \"seed\": %u,\n", seed);
   std::fprintf(out, "  \"shapes\": [\n");
   for (int i = 0; i < shape_count; ++i) {
-    ShapeResult r = measure(*op, shapes[i][0], shapes[i][1], repeats, seed + static_cast<unsigned int>(i));
+    ShapeResult r = measure(*op, shapes[i][0], shapes[i][1], repeats, seed + static_cast<unsigned int>(i), phase_fd);
     std::fprintf(out, "    {\"rows\": %d, \"cols\": %d, \"min_ms\": %.6f, \"median_ms\": %.6f, \"p90_ms\": %.6f, \"p25_ms\": %.6f, \"p75_ms\": %.6f, \"outliers\": %d, \"max_ms\": %.6f, "
                 "\"max_abs_err\": %.6g, \"max_rel_err\": %.6g, \"violation\": %.6g, \"has_nonfinite\": %s, "
                 "\"wrote_output\": %s, \"input_sensitive\": %s, "

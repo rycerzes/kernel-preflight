@@ -74,6 +74,11 @@ IMPLAUSIBLE_FRACTION = 0.95
 # enough for the DRAM roofline to bound it.
 L2_CLEARANCE = 2.0
 
+# How much the provenance bound forgives the median being an estimator rather than a
+# mean. Measured headroom between the claim and the externally observed interval is
+# 1.16-1.19x on honest kernels, so 1.05 leaves the check meaningful.
+SAMPLE_ESTIMATOR_ALLOWANCE = 1.05
+
 # Dense FLOPs per SM per clock, by compute capability and precision class.
 #
 # Derived from published *dense* peak TFLOPS divided by (SM count x boost clock),
@@ -161,9 +166,24 @@ def _shape_label(shape: dict[str, Any]) -> str:
     return f"{shape['rows']}x{shape['cols']}"
 
 
-# TF32 rounds operands to 10 mantissa bits and accumulates in fp32, so its error
-# is operand quantisation: a flat bar, with the usual safety factor.
-TF32_TOLERANCE = 8.0 * 2.0 ** -(MANTISSA_BITS["tf32"] + 1)
+# TF32 rounds operands to 10 mantissa bits and accumulates in fp32, so its error is
+# operand quantisation and does not grow with reduction depth. What it does depend on is
+# how much averaging the operation gives that quantisation, and that is not the gate's
+# business to know -- so the harness reports a per-shape `quantisation_safety` and this
+# only supplies the unit roundoff.
+#
+# The distinction is not theoretical. With one flat factor of 8 the bar sat exactly on
+# top of legitimate variation: non-causal FlashAttention passed at 0.78 of it while the
+# *causal* version of the same kernel failed at up to 2.2x, with a worst absolute error
+# of 1.2e-3 against 1.3e-4. That gap is the operation, not the kernel -- a causal row
+# near the start of the sequence attends to one or two keys, so its output is a
+# TF32-rounded weight times a TF32-rounded value with no averaging at all. Raising the
+# single constant far enough for that would have made it six times looser than a TF32
+# matmul needs, which is why it is per op instead.
+TF32_UNIT_ROUNDOFF = 2.0 ** -(MANTISSA_BITS["tf32"] + 1)
+
+# Used when a measurement predates the field, so an old one still grades.
+DEFAULT_QUANTISATION_SAFETY = 8.0
 
 
 def _times(x: float) -> str:
@@ -194,8 +214,9 @@ def _violation_scale(measurement: dict[str, Any], shape: dict[str, Any]) -> floa
     A fixed multiplier therefore gets the shape of the curve wrong as well as its
     height. Multiplying a sqrt(depth) base by 2^13 reached 0.5 at k=4096 -- about
     128x looser than the contract, and loosening further the deeper the reduction,
-    which is backwards. The bar is `TF32_TOLERANCE` instead, converted here into
-    the units `violation` is already reported in.
+    which is backwards. The bar is instead a flat one: the harness's per-op
+    `quantisation_safety` times the TF32 unit roundoff, converted here into the units
+    `violation` is already reported in.
 
     Never below 1.0: for a reduction deep enough that the fp32 accumulation bar
     exceeds the TF32 quantisation bar, the wider of the two is the honest one, and
@@ -207,7 +228,8 @@ def _violation_scale(measurement: dict[str, Any], shape: dict[str, Any]) -> floa
     reported = float(shape.get("rel_tol", 0.0))
     if reported <= 0.0:
         return 1.0
-    return max(1.0, TF32_TOLERANCE / reported)
+    safety = float(shape.get("quantisation_safety") or DEFAULT_QUANTISATION_SAFETY)
+    return max(1.0, safety * TF32_UNIT_ROUNDOFF / reported)
 
 
 def check_correctness(measurement: dict[str, Any]) -> GateResult:
@@ -270,6 +292,39 @@ def check_input_sensitivity(measurement: dict[str, Any]) -> GateResult:
     return GateResult("input_sensitivity", GateStatus.PASS, "output tracks the input at every shape")
 
 
+def _contention_note(measurement: dict[str, Any]) -> str:
+    """Whether the device looked contended while this was measured.
+
+    Exceeding the spread threshold means a whole quartile of samples ran far slower
+    than another quartile, which is not one scheduler hiccup -- it is either an
+    unstable kernel or a device that was busy for the duration. The report cannot
+    tell those apart on the ratio alone, and they call for opposite responses: one
+    is "re-run this", the other is "rewrite this".
+
+    The clock the harness sampled during the run separates them cheaply. Measured
+    over 28 runs of one honest kernel, the spread stayed within 1.13x at every
+    repeat count between 5 and 50, so a reading past 1.5 is unusual enough to be
+    worth explaining rather than just reporting.
+    """
+    observed = [s["sm_clock_hz_observed"] for s in measurement["shapes"] if s.get("sm_clock_hz_observed")]
+    peak = measurement.get("sm_clock_hz")
+    if not observed or not peak:
+        return ""
+    ratio = (sum(observed) / len(observed)) / float(peak)
+    if ratio < 0.9:
+        return (
+            f". The device ran at {ratio:.0%} of peak clock during this measurement, so it "
+            f"was throttled or contended -- re-run on an idle device before changing the kernel"
+        )
+    # Can exceed 1.0: the attribute clock is a nominal boost figure and a lightly
+    # loaded device transiently goes above it, which says nothing about contention.
+    held = min(ratio, 1.0)
+    return (
+        f". The device held {held:.0%} of peak clock throughout, so this is the kernel "
+        f"rather than the machine"
+    )
+
+
 def check_variance(measurement: dict[str, Any]) -> GateResult:
     worst_ratio = 0.0
     worst_shape = ""
@@ -284,7 +339,8 @@ def check_variance(measurement: dict[str, Any]) -> GateResult:
             "variance",
             GateStatus.FAIL,
             f"interquartile spread is {worst_ratio:.2f}x at {worst_shape}; half the samples "
-            f"disagree by that much, so the median does not summarise this kernel",
+            f"disagree by that much, so the median does not summarise this kernel"
+            f"{_contention_note(measurement)}",
         )
     spikes = sum(int(s.get("outliers", 0)) for s in measurement["shapes"])
     note = f"; {spikes} sample(s) above 2x median, not counted against it" if spikes else ""
@@ -508,19 +564,48 @@ def check_provenance(measurement: dict[str, Any]) -> GateResult:
             f"{observed_ms:.0f} ms — it cannot have spent time that did not elapse",
         )
 
-    # Internal consistency: the timed loops alone cannot exceed the whole run.
-    timed_ms = sum(s["median_ms"] for s in measurement["shapes"]) * prov["repeats"]
-    if timed_ms > claimed_ms:
+    # Internal consistency: the timed loops alone cannot exceed the run that
+    # contained them.
+    #
+    # `median_ms` is per *launch*, and each sample batches `inner_iters` launches, so
+    # the wall time a shape's loops actually consumed is median x inner x repeats.
+    # Leaving `inner_iters` out understated the claim by up to 40x on the small
+    # shapes, which made this check vacuous rather than merely loose.
+    #
+    # SAMPLE_ESTIMATOR_ALLOWANCE covers the median being an estimator rather than a
+    # mean: a left-skewed sample could put median slightly above the average launch.
+    # Timing distributions skew right, so this is a guard against a shape of noise
+    # that has not been observed here, sized well inside the measured headroom.
+    timed_ms = (
+        sum(s["median_ms"] * max(1, int(s.get("inner_iters", 1) or 1)) for s in measurement["shapes"])
+        * prov["repeats"]
+        / SAMPLE_ESTIMATOR_ALLOWANCE
+    )
+
+    # Prefer the interval the supervisor timed around the loops themselves. The
+    # whole-process figure carries seconds of torch import and float64 reference
+    # computation, and that slack is exactly what a forged measurement spends: a
+    # claim of 30 ms of timed work sits comfortably inside a 5-second process.
+    phase_ms = measurement.get("timed_phase_ms")
+    bound_ms, bound_name = (
+        (float(phase_ms), "the timed loops the supervisor observed")
+        if isinstance(phase_ms, (int, float)) and phase_ms > 0
+        else (claimed_ms, "the run")
+    )
+    if timed_ms > bound_ms:
         return GateResult(
             "provenance",
             GateStatus.FAIL,
-            f"timed loops sum to {timed_ms:.0f} ms inside a {claimed_ms:.0f} ms run",
+            f"timed loops sum to {timed_ms:.0f} ms inside {bound_ms:.0f} ms of "
+            f"{bound_name}",
         )
 
+    tightness = f", {timed_ms:.0f} ms of it inside {bound_ms:.0f} ms of timed loops" if phase_ms else ""
     return GateResult(
         "provenance",
         GateStatus.PASS,
-        f"nonce echoed; {claimed_ms:.0f} ms of work inside a {observed_ms:.0f} ms process",
+        f"nonce echoed; {claimed_ms:.0f} ms of work inside a {observed_ms:.0f} ms process"
+        f"{tightness}",
     )
 
 

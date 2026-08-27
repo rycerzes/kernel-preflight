@@ -51,7 +51,20 @@ DEFAULT_ARCH = "sm_89"
 # against driver.py. Both emit the same measurement schema, so the gates do not
 # know or care which produced a verdict.
 CUDA_OPS = ("rmsnorm", "softmax", "silu", "transpose")
-PYTHON_OPS = ("rmsnorm", "softmax", "silu", "transpose", "matmul", "attention")
+PYTHON_OPS = (
+    "rmsnorm", "softmax", "silu", "transpose", "matmul", "attention",
+    # The two categories KernelBenchX finds hardest: Fusion (72% failure) and
+    # Quantization (0 of 30 solved), plus LayerNorm for its two-stage reduction.
+    "layernorm", "swiglu", "quantize",
+    # Index and Loss from the same taxonomy, plus RoPE because essentially every
+    # deployed transformer runs it and fusing it with attention is where the
+    # inference engines find their wins.
+    "rope", "gather", "cross_entropy",
+    # Causal changes the FLOP count; decode moves attention to the other side of the
+    # ridge point, so the same schema gets audited against a different ceiling.
+    "attention_causal", "attention_decode", "attention_gqa", "moe_gemm",
+    "attention_paged", "attention_backward",
+)
 PYTHON_BACKENDS = ("triton", "helion", "torch", "cute", "tilelang")
 SUPPORTED_BACKENDS = ("cuda", *PYTHON_BACKENDS)
 # The numerical contract a candidate claims. Declaring a reduced precision widens
@@ -302,7 +315,7 @@ def preflight_source(
             # them and owns the write.
             run_argv = [
                 "python3", "supervisor.py", "--",
-                "./preflight", op, str(repeats), str(seed), precision, "{fd}",
+                "./preflight", op, str(repeats), str(seed), precision, "{fd}", "{phase_fd}",
             ]
             control = json.dumps({"nonce": nonce, "out": MEASUREMENT_FILE})
         else:
@@ -320,6 +333,7 @@ def preflight_source(
                 "--seed", str(seed),
                 "--precision", precision,
                 "--result-fd", "{fd}",
+                "--phase-fd", "{phase_fd}",
             ]
             # Deliberately not flags. driver.py runs a supervisor that spawns the
             # process which imports the candidate, and passes it neither of these,

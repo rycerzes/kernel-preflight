@@ -51,9 +51,43 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 FD_PLACEHOLDER = "{fd}"
+PHASE_FD_PLACEHOLDER = "{phase_fd}"
+
+
+def _watch_phases(read_fd: int, out: list[float]) -> None:
+    """Time each of the worker's timed loops from outside the worker.
+
+    The worker writes `B` when a timing loop starts and `E` when it ends. This
+    process cannot see inside it, but it can see when a byte arrives, so the
+    duration between them is measured on a clock the measured code does not own.
+
+    Why it matters: `harness_wall_ms` used to be the worker's whole lifetime, which
+    includes several seconds of importing torch and computing float64 references.
+    All of that was slack -- a forged measurement claiming 30 ms of timed work sat
+    comfortably inside a 5-second process. Summing only the bracketed intervals
+    removes it, so a claim of near-peak throughput has to be matched by wall time
+    actually spent inside the loops.
+
+    A compromised worker still controls when it writes the markers, so this bounds
+    the claim rather than proving it: to claim time it must now spend that time.
+    Spending it without doing the work is the residual, and the correctness,
+    input-sensitivity and timed-work gates are what stand against that.
+    """
+    started: float | None = None
+    with os.fdopen(read_fd, "rb", buffering=0) as handle:
+        while True:
+            byte = handle.read(1)
+            if not byte:
+                break
+            if byte == b"B":
+                started = time.perf_counter()
+            elif byte == b"E" and started is not None:
+                out.append((time.perf_counter() - started) * 1000.0)
+                started = None
 
 
 def main() -> int:
@@ -76,16 +110,27 @@ def main() -> int:
         return 2
 
     read_fd, write_fd = os.pipe()
-    argv = [a.replace(FD_PLACEHOLDER, str(write_fd)) for a in worker_argv]
+    phase_read_fd, phase_write_fd = os.pipe()
+    argv = [
+        a.replace(FD_PLACEHOLDER, str(write_fd)).replace(PHASE_FD_PLACEHOLDER, str(phase_write_fd))
+        for a in worker_argv
+    ]
+
+    phase_ms: list[float] = []
+    watcher = threading.Thread(target=_watch_phases, args=(phase_read_fd, phase_ms), daemon=True)
+    watcher.start()
 
     started = time.perf_counter()
     try:
-        proc = subprocess.Popen(argv, pass_fds=(write_fd,), stdin=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            argv, pass_fds=(write_fd, phase_write_fd), stdin=subprocess.DEVNULL
+        )
     except OSError as exc:
         print(f"supervisor: cannot start worker: {exc}", file=sys.stderr)
         return 2
-    # Close this end so the read side sees EOF when the worker exits.
+    # Close these ends so the read sides see EOF when the worker exits.
     os.close(write_fd)
+    os.close(phase_write_fd)
 
     # Drain before waiting: a payload larger than the pipe buffer would otherwise
     # block the worker while this process blocks on its exit.
@@ -98,6 +143,7 @@ def main() -> int:
             chunks.append(chunk)
     returncode = proc.wait()
     observed_ms = (time.perf_counter() - started) * 1000.0
+    watcher.join(timeout=5.0)
 
     raw = b"".join(chunks)
     if not raw:
@@ -114,10 +160,16 @@ def main() -> int:
         print("supervisor: worker reported a non-object", file=sys.stderr)
         return 5
 
-    # Stamped, not copied. These are the two facts the provenance gate rests on,
-    # and the worker is not a source for either of them.
+    # Stamped, not copied. These are the facts the provenance gate rests on, and the
+    # worker is not a source for any of them.
     payload["nonce"] = nonce
     payload["harness_wall_ms"] = observed_ms
+    # Sum of the intervals this process timed around the worker's timing loops, when
+    # the worker bracketed them. The gate prefers this to the whole-process figure
+    # because it carries no import or reference-computation slack.
+    if phase_ms:
+        payload["timed_phase_ms"] = sum(phase_ms)
+        payload["timed_phase_count"] = len(phase_ms)
 
     with open(out_path, "w") as handle:
         json.dump(payload, handle)

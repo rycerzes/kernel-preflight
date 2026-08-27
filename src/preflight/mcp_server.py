@@ -65,7 +65,26 @@ def device_spec() -> dict[str, Any]:
         "Ops: rmsnorm (row reduction, uses w and eps), softmax (row reduction, "
         "numerically delicate), silu (pure elementwise), transpose (pure memory "
         "movement, y is cols x rows), matmul and attention (compute-bound, audited "
-        "against the arithmetic ceiling rather than the memory bus)."
+        "against the arithmetic ceiling rather than the memory bus), layernorm "
+        "(inputs x, gamma, beta; needs the mean before the variance), swiglu "
+        "(inputs a, b; silu(a) * b, a fusion where the win is touching each input "
+        "once), and quantize (input x; per-row symmetric int8 round trip with a "
+        "power-of-two scale, so the correct answer is bit-exact -- derive the scale, "
+        "round to nearest even, clamp, scale back), rope (inputs x, cos, sin; "
+        "split-half rotary embedding, where output element i depends on element "
+        "i + d/2 so the row cannot be tiled independently), gather (inputs table, "
+        "idx; out[i] = table[idx[i]], irregular access that cannot reach peak "
+        "bandwidth at any quality), and cross_entropy (inputs logits, target; one "
+        "unreduced loss per row, so the output is smaller than the input), "
+        "attention_causal (masked, so the FLOP count is halved and the cost model says "
+        "so), attention_decode (one query against a KV cache, memory-bound rather than "
+        "compute-bound and audited against the bus), attention_gqa (32 query heads "
+        "sharing 8 KV heads, where the win is indexing the shared head rather than "
+        "expanding it), attention_paged (the KV cache in scattered fixed-size blocks "
+        "addressed through a block table), attention_backward (dQ, dK, dV stacked into "
+        "one output; the forward's probabilities are not given, so recomputing them is "
+        "part of the work) and moe_gemm (out[i] = x[i] @ w[expert[i]]; the difficulty "
+        "is the grouping, not the arithmetic)."
     ),
 )
 def preflight_kernel(
@@ -74,7 +93,9 @@ def preflight_kernel(
         str,
         Field(
             description="Operation to measure: rmsnorm, softmax, silu or transpose on any "
-            "backend; matmul and attention on the Python backends only."
+            "backend; matmul, attention, layernorm, swiglu, quantize, rope, gather, "
+            "cross_entropy, attention_causal, attention_decode, attention_gqa, "
+            "attention_paged, attention_backward and moe_gemm on the Python backends only."
         ),
     ] = "rmsnorm",
     arch: Annotated[str, Field(description="Target architecture, e.g. sm_89.")] = "sm_89",
