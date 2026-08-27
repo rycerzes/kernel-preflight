@@ -39,6 +39,15 @@ CASES = [
     ("triton_flash_attention.py",     "attention", "triton",   "fp32", "FlashAttention declared fp32"),
     ("triton_flash_attention.py",     "attention", "triton",   "tf32", "the same kernel, declared tf32"),
     ("triton_flash_attention.py",     "attention", "triton",   "bf16", "the same kernel, declared bf16"),
+    # --- The two categories KernelBenchX finds hardest, plus LayerNorm's two-stage
+    # --- reduction. Fusion fails 72% of the time across every method they tested and
+    # --- Quantization is 0 of 30, so these are where a harness earns its keep.
+    ("torch_layernorm.py",            "layernorm", "torch",    "fp32", "torch's fused layer_norm"),
+    ("triton_layernorm.py",           "layernorm", "triton",   "fp32", "one pass, mean and variance together"),
+    ("torch_swiglu.py",               "swiglu",    "torch",    "fp32", "unfused, materialises the intermediate"),
+    ("triton_swiglu.py",              "swiglu",    "triton",   "fp32", "fused, one pass per input"),
+    ("torch_quantize.py",             "quantize",  "torch",    "fp32", "unfused int8 round trip"),
+    ("triton_quantize.py",            "quantize",  "triton",   "fp32", "exponent from the float bits"),
     # --- Wrong, but not dishonest. Must fail on correctness with a readable reason.
     ("wrong_transpose.cu",            "transpose", "cuda",     "fp32", "off by one row"),
     # --- Adversarial. Every one of these must be rejected.
@@ -52,6 +61,7 @@ CASES = [
     ("cheat_silent_bf16.py",          "attention", "torch",    "fp32", "computes in bf16 while declaring fp32"),
     ("cheat_pay_the_clock.py",        "matmul",    "torch",    "fp32", "cached answer, caught on the compute axis"),
     ("cheat_cached_timed.py",         "rmsnorm",   "torch",    "fp32", "cached answer, memory-bound: needs the input drift"),
+    ("cheat_truncating_quantize.py",  "quantize",  "torch",    "fp32", "truncates instead of rounding"),
     # --- Reduced storage precision, on the backends that can honour it.
     ("triton_rmsnorm.py",             "rmsnorm",   "triton",   "fp16", "fp16 storage"),
     ("tilelang_rmsnorm.py",           "rmsnorm",   "tilelang", "bf16", "bf16 storage"),

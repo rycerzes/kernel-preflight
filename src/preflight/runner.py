@@ -51,7 +51,12 @@ DEFAULT_ARCH = "sm_89"
 # against driver.py. Both emit the same measurement schema, so the gates do not
 # know or care which produced a verdict.
 CUDA_OPS = ("rmsnorm", "softmax", "silu", "transpose")
-PYTHON_OPS = ("rmsnorm", "softmax", "silu", "transpose", "matmul", "attention")
+PYTHON_OPS = (
+    "rmsnorm", "softmax", "silu", "transpose", "matmul", "attention",
+    # The two categories KernelBenchX finds hardest: Fusion (72% failure) and
+    # Quantization (0 of 30 solved), plus LayerNorm for its two-stage reduction.
+    "layernorm", "swiglu", "quantize",
+)
 PYTHON_BACKENDS = ("triton", "helion", "torch", "cute", "tilelang")
 SUPPORTED_BACKENDS = ("cuda", *PYTHON_BACKENDS)
 # The numerical contract a candidate claims. Declaring a reduced precision widens

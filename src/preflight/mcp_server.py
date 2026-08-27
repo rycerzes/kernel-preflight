@@ -65,7 +65,12 @@ def device_spec() -> dict[str, Any]:
         "Ops: rmsnorm (row reduction, uses w and eps), softmax (row reduction, "
         "numerically delicate), silu (pure elementwise), transpose (pure memory "
         "movement, y is cols x rows), matmul and attention (compute-bound, audited "
-        "against the arithmetic ceiling rather than the memory bus)."
+        "against the arithmetic ceiling rather than the memory bus), layernorm "
+        "(inputs x, gamma, beta; needs the mean before the variance), swiglu "
+        "(inputs a, b; silu(a) * b, a fusion where the win is touching each input "
+        "once), and quantize (input x; per-row symmetric int8 round trip with a "
+        "power-of-two scale, so the correct answer is bit-exact -- derive the scale, "
+        "round to nearest even, clamp, scale back)."
     ),
 )
 def preflight_kernel(
@@ -74,7 +79,8 @@ def preflight_kernel(
         str,
         Field(
             description="Operation to measure: rmsnorm, softmax, silu or transpose on any "
-            "backend; matmul and attention on the Python backends only."
+            "backend; matmul, attention, layernorm, swiglu and quantize on the Python "
+            "backends only."
         ),
     ] = "rmsnorm",
     arch: Annotated[str, Field(description="Target architecture, e.g. sm_89.")] = "sm_89",

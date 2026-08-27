@@ -259,6 +259,147 @@ def _transpose(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dty
     )
 
 
+def _layernorm(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """LayerNorm with affine gamma and beta.
+
+    Distinct from rmsnorm rather than a variation on it: rmsnorm needs one reduction,
+    LayerNorm needs the mean before the variance. A kernel can compute both in one
+    pass with Welford or a sum/sum-of-squares pair, and getting the numerics of that
+    wrong is the classic error in this operation -- E[x^2] - E[x]^2 loses catastrophic
+    precision when the mean dominates the variance, which is exactly the case these
+    inputs produce.
+
+    KernelBenchX puts Normalization in the middle of its difficulty range and finds
+    the failures come from scope: normalising over the wrong axis, or mixing
+    statistics across rows.
+    """
+    x = make_input((rows, cols), seed, dev, dtype=dt)
+    gamma = make_input((cols,), seed ^ 0x6A11, dev, dtype=dt)
+    beta = make_input((cols,), seed ^ 0x7B22, dev, dtype=dt)
+    eps = 1e-5
+
+    def _ref() -> torch.Tensor:
+        xd, gd, bd = x.double(), gamma.double(), beta.double()
+        mean = xd.mean(dim=-1, keepdim=True)
+        var = (xd - mean).pow(2).mean(dim=-1, keepdim=True)
+        return (xd - mean) * torch.rsqrt(var + eps) * gd + bd
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"x": x, "gamma": gamma, "beta": beta},
+        out=torch.empty_like(x),
+        meta={"rows": rows, "cols": cols, "eps": eps},
+        reference=ref,
+        recompute=_ref,
+        bytes_moved=2.0 * n * dt.itemsize,
+        flops=8.0 * n,
+        working_set_bytes=2.0 * n * dt.itemsize,
+        rel_tol=accumulation_tolerance(cols, dt=dt),
+    )
+
+
+def _swiglu(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """SwiGLU gating: silu(a) * b, the second half of a Llama-style MLP.
+
+    Here because Fusion is both the largest category in KernelBenchX (60 of 176 tasks)
+    and by far the worst performing: 72% of its tasks fail across every method they
+    tested. The interest is not the arithmetic, which is trivial, but that a fused
+    kernel has to hold an invariant across an operator boundary that the unfused
+    version gets from materialising an intermediate.
+
+    Three passes of traffic against five FLOP an element, so it is firmly
+    memory-bound and the question is whether a candidate reads each input once.
+    """
+    a = make_input((rows, cols), seed, dev, dtype=dt)
+    b = make_input((rows, cols), seed ^ 0x9C33, dev, dtype=dt)
+
+    def _ref() -> torch.Tensor:
+        ad, bd = a.double(), b.double()
+        return ad * torch.sigmoid(ad) * bd
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"a": a, "b": b},
+        out=torch.empty_like(a),
+        meta={"rows": rows, "cols": cols},
+        reference=ref,
+        recompute=_ref,
+        # a and b read, out written.
+        bytes_moved=3.0 * n * dt.itemsize,
+        flops=5.0 * n,
+        working_set_bytes=3.0 * n * dt.itemsize,
+        rel_tol=accumulation_tolerance(1, dt=dt),
+    )
+
+
+def _quantize(rows: int, cols: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
+    """Per-row symmetric int8 quantise-dequantise with a power-of-two scale.
+
+    Quantization is the category KernelBenchX reports as completely unsolved -- 0
+    successes out of 30 across every method they evaluated -- because it is the one
+    that cannot be done by transcribing a formula. The kernel has to derive its own
+    scale from a reduction, round rather than truncate, clamp to the integer range, and
+    scale back.
+
+    **The scale is a power of two, and that is not a simplification.** The first
+    version of this op used absmax/127, and it could not be graded: quantization is a
+    discontinuous function, so a value within an ulp of a rounding boundary lands on a
+    different integer in float32 than in the float64 reference, and the disagreement is
+    a full step -- measured at 7.7% relative error on a correct kernel. Comparing a
+    discontinuous operation against a higher-precision reference is ill-posed wherever
+    the input sits near a discontinuity, and no tolerance fixes that: one wide enough to
+    admit the boundary cases also admits truncation, which is the error the op exists to
+    catch.
+
+    A power-of-two scale removes the ambiguity instead of tolerating it. `absmax` is
+    exact because a max reduction is exact; taking its binary exponent with `frexp` is
+    exact; dividing by 2^k is an exponent shift and therefore exact; so `x / scale` is
+    identical in float32 and float64 and `round` lands on the same integer in both. The
+    whole round trip is bit-exact, the tolerance can stay at storage quantisation, and a
+    kernel that truncates instead of rounding fails immediately rather than hiding
+    inside an allowance.
+
+    Scaling by a power of two is also what several real quantisation schemes do, for
+    the same reason.
+    """
+    x = make_input((rows, cols), seed, dev, dtype=dt)
+    qmax = 127.0
+
+    def _ref() -> torch.Tensor:
+        xd = x.double()
+        absmax = xd.abs().amax(dim=-1, keepdim=True)
+        # 2^e with absmax in [2^(e-1), 2^e), then /128 rather than /127 so the divisor
+        # is itself a power of two and the division stays exact.
+        _, exponent = torch.frexp(absmax)
+        scale = torch.ldexp(torch.ones_like(absmax), exponent - 7)
+        # An all-zero row has no scale; leave it rather than divide by zero.
+        scale = torch.where(absmax > 0, scale, torch.ones_like(scale))
+        q = torch.clamp(torch.round(xd / scale), -qmax, qmax)
+        return q * scale
+
+    ref = _ref()
+    n = rows * cols
+    return Problem(
+        label=f"{rows}x{cols}",
+        inputs={"x": x},
+        out=torch.empty_like(x),
+        meta={"rows": rows, "cols": cols, "qmax": qmax},
+        reference=ref,
+        recompute=_ref,
+        bytes_moved=2.0 * n * dt.itemsize,
+        flops=4.0 * n,
+        working_set_bytes=2.0 * n * dt.itemsize,
+        # Deliberately not an accumulation tolerance: nothing accumulates, and with a
+        # power-of-two scale nothing rounds either. The bar is storage quantisation
+        # alone, which is as tight as this harness can ask for.
+        rel_tol=8.0 * quantisation_error(dt),
+    )
+
+
 def _matmul(m: int, k: int, seed: int, dev: torch.device, dt: torch.dtype) -> Problem:
     """Square-ish GEMM. The first op in the set that is compute-bound.
 
@@ -340,6 +481,9 @@ OPS: dict[str, tuple[Callable[..., Problem], tuple[tuple[int, int], ...]]] = {
     "transpose": (_transpose, ((512, 2048), (1024, 4096), (4096, 4096), (8192, 4096), (16384, 4096))),
     "matmul": (_matmul, ((512, 512), (1024, 1024), (2048, 2048), (4096, 4096))),
     "attention": (_attention, ((512, 64), (1024, 64), (2048, 64), (1024, 128))),
+    "layernorm": (_layernorm, ((512, 2048), (1024, 4096), (4096, 4096), (8192, 4096), (16384, 4096))),
+    "swiglu": (_swiglu, ((512, 2048), (1024, 4096), (4096, 4096), (8192, 4096), (16384, 4096))),
+    "quantize": (_quantize, ((512, 2048), (1024, 4096), (4096, 4096), (8192, 4096), (16384, 4096))),
 }
 
 
