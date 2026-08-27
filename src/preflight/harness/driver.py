@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import ctypes
 import json
 import math
 import os
@@ -361,18 +362,60 @@ def deviation(got: torch.Tensor, want: torch.Tensor, rel_tol: float) -> tuple[fl
     return max_abs, max_rel, violation, has_nonfinite
 
 
+_NVML_CLOCK_SM = 1
+_nvml_handle: Any = None
+_nvml_lib: Any = None
+_nvml_tried = False
+
+
+def _nvml() -> tuple[Any, Any]:
+    """NVML through ctypes, initialised once. Returns (lib, handle) or (None, None).
+
+    Not `torch.cuda.clock_rate()`: that routes through pynvml, which is not in the
+    sandbox image, so it raised and the clock was silently recorded as None on every
+    run. Two gate notes depend on this value -- the roofline throttle warning and the
+    variance gate's kernel-versus-machine attribution -- so a silent None disabled
+    both of them without anything failing.
+
+    `libnvidia-ml.so.1` needs no package: it arrives with the driver, and the
+    container runtime mounts it alongside the device nodes.
+    """
+    global _nvml_handle, _nvml_lib, _nvml_tried
+    if _nvml_tried:
+        return _nvml_lib, _nvml_handle
+    _nvml_tried = True
+    try:
+        lib = ctypes.CDLL("libnvidia-ml.so.1")
+        if lib.nvmlInit_v2() != 0:
+            return None, None
+        handle = ctypes.c_void_p()
+        index = torch.cuda.current_device()
+        if lib.nvmlDeviceGetHandleByIndex_v2(ctypes.c_int(index), ctypes.byref(handle)) != 0:
+            return None, None
+        _nvml_lib, _nvml_handle = lib, handle
+    except Exception:
+        _nvml_lib, _nvml_handle = None, None
+    return _nvml_lib, _nvml_handle
+
+
 def current_sm_clock_hz() -> float | None:
     """Actual SM clock right now, or None if it cannot be read.
 
-    Matters because the roofline ceiling is derived from the *maximum* clock. A
-    GPU that is thermally or power throttled never had access to that peak, so a
+    Matters because the roofline ceiling is derived from the *maximum* clock. A GPU
+    that is thermally or power throttled never had access to that peak, so a
     perfectly good kernel measures low and a reader concludes the kernel is bad.
-    Observed here: a sweep run immediately after 900 seconds of sustained
-    autotuning measured roughly a third of the throughput the same kernel reached
-    on an idle device.
+    Observed here: a sweep run immediately after 900 seconds of sustained autotuning
+    measured roughly a third of the throughput the same kernel reached on an idle
+    device.
     """
+    lib, handle = _nvml()
+    if lib is None or handle is None:
+        return None
     try:
-        return float(torch.cuda.clock_rate()) * 1e6  # torch reports MHz
+        mhz = ctypes.c_uint()
+        if lib.nvmlDeviceGetClockInfo(handle, ctypes.c_int(_NVML_CLOCK_SM), ctypes.byref(mhz)) != 0:
+            return None
+        return float(mhz.value) * 1e6
     except Exception:
         return None
 

@@ -294,7 +294,13 @@ def _contention_note(measurement: dict[str, Any]) -> str:
             f". The device ran at {ratio:.0%} of peak clock during this measurement, so it "
             f"was throttled or contended -- re-run on an idle device before changing the kernel"
         )
-    return ". The device held {:.0%} of peak clock throughout, so this is the kernel rather than the machine".format(ratio)
+    # Can exceed 1.0: the attribute clock is a nominal boost figure and a lightly
+    # loaded device transiently goes above it, which says nothing about contention.
+    held = min(ratio, 1.0)
+    return (
+        f". The device held {held:.0%} of peak clock throughout, so this is the kernel "
+        f"rather than the machine"
+    )
 
 
 def check_variance(measurement: dict[str, Any]) -> GateResult:
