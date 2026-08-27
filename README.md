@@ -131,7 +131,7 @@ Measured on an RTX 4090 (sm_89, driver 580.159.04, CUDA 13.2):
 | 5 MiB upload/download round-trip | byte-exact |
 | Agent end to end: skill → sandbox → gates | rmsnorm admitted at 91.1% of the bus, first submission |
 | Agent on a compute-bound op it was not tuned for | Triton matmul admitted at 60.9% of the fp32 ceiling, beating the hand-written `triton_matmul.py` at 58.2% |
-| Gate unit suite | 35/35 |
+| Gate unit suite | 39/39 |
 
 The device ceiling is corroborated two ways: `preflight.device` derives
 **1008.1 GB/s** from the CUDA driver attribute API, and an independent CUDA C
@@ -139,28 +139,32 @@ bandwidth kernel measures against the same figure.
 
 ### The kernel matrix
 
-28 cases in one session on one GPU, with a thermal cooldown between each so the
+34 cases in one session on one GPU, with a thermal cooldown between each so the
 figures are comparable — `benchmark/full_matrix.py`. A sweep run straight after
 Helion's autotuner once read a third of the throughput of the same kernel idle,
 which is why Helion is scheduled last and why the harness samples the SM clock and
 says so when it ran below peak.
 
-**17 admitted, 11 not, and every one of the 8 adversarial candidates rejected.**
+**23 admitted, 11 not, and every one of the 8 adversarial candidates rejected.**
 
 One op, five toolchains — the comparison the gates are indifferent to, because they
 adjudicate a measurement schema rather than a toolchain:
 
 | rmsnorm | fp32, % of the 1008.1 GB/s bus |
 | --- | --- |
-| hand-written CUDA | 90.1% |
-| TileLang | 90.7% |
-| Triton | 89.6% |
+| hand-written CUDA | 90.0% |
+| TileLang | 90.6% |
+| Triton | 89.5% |
 | Helion (autotuned) | 89.1% |
-| CuTe DSL, one warp per row | 56.4% |
-| eager PyTorch | 26.2% |
+| CuTe DSL, block per row via shared memory | 85.9% |
+| eager PyTorch | 26.1% |
 
-Memory-bound, other ops: CUDA softmax 90.2%, CUDA silu 91.2%, TileLang silu 90.6%,
-CuTe silu 88.6%, CUDA transpose 30.4%.
+Memory-bound, other ops: CUDA softmax 89.8%, CUDA silu 91.3%, TileLang silu 90.6%,
+CuTe silu 88.7%, CUDA transpose 30.5%.
+
+Reduced storage precision, on the backends that can honour it: Triton rmsnorm fp16
+90.0%, TileLang rmsnorm bf16 90.5%, TileLang silu fp16 90.8%, CuTe rmsnorm bf16 84.5%
+and fp16 84.7%, Triton FlashAttention fp16 81.5% of the fp16 ceiling.
 
 Compute-bound, audited against the arithmetic ceiling rather than the bus:
 
@@ -234,7 +238,10 @@ compiled for, so the caches are keyed on shape.
   Utilisation is reported against the rate verified on this hardware, but a claim is
   only refused past the widest rate any part of that capability is rated for. fp32
   keeps a hard ceiling, and that is the axis the bf16 catch above runs on.
-- **fp16 is implemented and untested.** Only sm_89 hardware was available.
+- **fp16 is exercised now**, which it previously was not, and the reason given for
+  that was wrong: sm_89 has fp16 tensor cores, so this hardware could always test it.
+  Six fp16 cases run in the matrix. Testing it also found two candidates hardcoding
+  `float32` and a shared-memory allocation that could not honour anything else.
 - **The worker's numbers are bounded, not proven.** See
   [the honest limits](#the-limit-this-does-not-clear).
 
@@ -267,12 +274,23 @@ behind. Hiding the values better would not have worked: `/proc/<ppid>/cmdline` a
 `/proc/<ppid>/mem` and `ptrace` are refused, which is what makes a sibling process
 the right boundary rather than a more careful flag.
 
-What remains: the worker still reports its own numbers on a descriptor. They are
-bounded — by a duration the supervisor observed from outside, and by the roofline,
-variance and timed-work gates — but bounded is not proven. Proving them would move
-the timing authority outside the worker entirely, measuring a known quantity of
-work from the other side of the process boundary. That is a larger change than this,
-and it is not done.
+What remains: the worker still reports its own numbers on a descriptor, so they are
+bounded rather than proven — but the bound is now tight. Both harnesses write a byte
+either side of every timing loop on a descriptor the supervisor owns, so those loops
+are timed on a clock the measured code does not control. `harness_wall_ms` used to be
+the worker's whole lifetime, several seconds of which is torch import and float64
+reference computation, so a forgery claiming 30 ms of work sat comfortably inside a
+5-second process. Counting `inner_iters` on the claim side closed the rest: the old
+formula understated the claim by up to 40x on the small shapes.
+
+Honest kernels now sit at **1.05x–1.27x** of the interval the supervisor observed,
+against roughly 43x of slack before. To claim near-peak throughput, a worker has to
+actually spend that wall time inside the loops.
+
+Spending it without doing the work is the residual, and `correctness`,
+`input_sensitivity` and `timed_work` are what stand against that. Removing it entirely
+means the supervisor owning allocation and verification too — plausibly over CUDA IPC
+— which is a redesign rather than a fix, and is not done.
 
 ## Layout
 
@@ -285,8 +303,8 @@ and it is not done.
 | `src/preflight/mcp_server.py` | the three tools TrueForge sees |
 | `src/preflight/device.py` | hardware ceilings read from the CUDA driver attribute API |
 | `src/preflight/harness/examples/` | 17 honest kernels across five toolchains, 8 adversarial, 1 merely wrong — all regression tests |
-| `benchmark/full_matrix.py` | the 28-case sweep behind the table above |
-| `tests/` | 35 gate tests, including the ones that fail against the pre-fix code |
+| `benchmark/full_matrix.py` | the 34-case sweep behind the table above |
+| `tests/` | 39 gate tests, including the ones that fail against the pre-fix code |
 | `agent/` | the saved TrueForge agent manifest |
 | `docker/` | the sandbox images: CUDA, plus torch/Triton/Helion/CuTe/TileLang |
 | `upstream/trueforge/` | changes to TrueForge itself, submitted upstream as [truefoundry/trueforge#467](https://github.com/truefoundry/trueforge/pull/467) |
@@ -397,10 +415,12 @@ is finally made against a duration the measured code does not control. A worker 
 exits early now leaves nothing behind — which the runner already treats as a
 rejection, and which is exactly what both forges now do.
 
-Both attacks are committed as regression tests. The residual limit is stated in
-[what it does not claim](#what-it-does-not-claim): the worker still reports its own
-numbers, bounded by an observed duration and by the roofline, variance and
-timed-work gates, but bounded is not proven.
+Both attacks are committed as regression tests, and `cheat_forge_proc.cu` now fails
+for the reason that matters: `argv` carries neither the nonce nor the output path any
+more, so there is nothing in `/proc/self/cmdline` worth reading. The defence is which
+process knows what, not how well a value is hidden inside one.
+
+The residual limit is stated in [what it does not claim](#what-it-does-not-claim).
 
 The same review round also found that the tf32 correctness bar was 128x looser than
 the contract, that five of six input builders silently ignored a declared reduced
