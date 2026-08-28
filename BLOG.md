@@ -15,6 +15,12 @@ catch it — a kernel can be numerically perfect and still be timed dishonestly.
 So I built an agent inside [TrueForge](https://github.com/truefoundry/trueforge) with one
 property: **it submits kernel source and never submits a number.**
 
+There is a [2m45s demo](video/out/kernel-preflight-demo.mp4) if you would rather watch it
+work. Four of its beats are a recorded session replayed verbatim — including the agent
+finding a precision trap unprompted, failing two submissions, reading the traceback, and
+earning nine green gates — and a fifth is a live run against a kernel that serves a cached
+answer while it is being timed.
+
 ---
 
 ## The arrangement

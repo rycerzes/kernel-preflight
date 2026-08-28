@@ -13,6 +13,23 @@ against the hardware's physical limits, and puts a human in front of publication
 submits to the gates and stops for approval before publishing. See
 [Verified](#verified) for what has been measured rather than asserted.
 
+## Demo
+
+[`video/out/kernel-preflight-demo.mp4`](video/out/kernel-preflight-demo.mp4) — 2m45s,
+1920x1080.
+
+Four of its eleven beats are a **recorded TrueForge session replayed verbatim**, read out
+of `thread_context_log` in the running instance (session `01m0zc9y`): the prompt, the
+`device_spec` reply, the agent finding the TF32 trap unprompted in its own reasoning, the
+`TypeError` it debugged across two failed submissions, and the nine-gate `ADMITTED` table
+it earned at 60.9% of the fp32 ceiling. A fifth beat is a live harness run against
+`cheat_cached_timed.py`, where eight gates pass, correctness passes, and `timed_work` fails
+at 5.06e+05x tolerance.
+
+Nothing in it is staged, and every number on screen is copied from the sweep below.
+[`video/README.md`](video/README.md) documents how it is built and what was measured on the
+delivered file.
+
 ## Why
 
 In February 2025, Sakana AI's "AI CUDA Engineer" reported 10-100x kernel speedups.
@@ -448,6 +465,7 @@ means the supervisor owning allocation and verification too — plausibly over C
 | `agent/` | the saved TrueForge agent manifest |
 | `docker/` | the sandbox images: CUDA, plus torch/Triton/Helion/CuTe/TileLang |
 | `upstream/trueforge/` | changes to TrueForge itself, submitted upstream as [truefoundry/trueforge#467](https://github.com/truefoundry/trueforge/pull/467) |
+| `video/` | the demo video: an HTML composition, the narration script, and the build |
 | `docs/` | investigation notes |
 
 ## Qodo Code Review Evidence
@@ -578,7 +596,7 @@ happens in a container with no network and no inherited environment.
 ## Write-up
 
 [`BLOG.md`](BLOG.md) — what the harness caught, including the three times it caught
-me, and the five times a gate accused correct work.
+me, and the six times a gate accused correct work.
 
 ## Notes
 
