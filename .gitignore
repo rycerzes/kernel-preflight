@@ -19,3 +19,7 @@ video/audio/
 
 # retrieved music, and the loop built from it (regenerate from audio_request.json)
 video/assets/
+
+# macOS / CLI scratch
+.DS_Store
+video/hyperframes.lock.json
