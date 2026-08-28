@@ -3,3 +3,19 @@ __pycache__/
 .venv/
 build/
 *.so
+
+# hyperframes render artifacts; the delivered video itself is tracked
+video/node_modules/
+video/package-lock.json
+video/out/*
+!video/out/kernel-preflight-demo.mp4
+video/snapshots/
+video/.hyperframes/
+video/AGENTS.md
+video/CLAUDE.md
+
+# generated narration (regenerate from video/SCRIPT.md)
+video/audio/
+
+# retrieved music, and the loop built from it (regenerate from audio_request.json)
+video/assets/
